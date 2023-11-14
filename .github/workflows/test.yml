@@ -1,0 +1,41 @@
+on:
+  pull_request:
+
+name: Unit tests
+jobs:
+  test_on_windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Go
+        uses: actions/setup-go@v3
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build executable
+        run: go build
+
+      - name: Run fast tests
+        run: go test -v -tags=fast ./...
+
+  test_on_linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Go
+        uses: actions/setup-go@v3
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build executable
+        run: go build
+
+      - name: Run fast tests
+        run: go test -v -tags=fast ./...
+
+      - name: Verify code formatting
+        run: test -z "$(gofmt -l .)"
