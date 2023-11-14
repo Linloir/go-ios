@@ -28,6 +28,17 @@ func (p *ProcessControl) LaunchApp(bundleID string) (uint64, error) {
 	return p.StartProcess(bundleID, env, []interface{}{}, opts)
 }
 
+// LaunchApp launches the app with ActivateSuspended
+func (p *ProcessControl) LaunchAppWithActivate(bundleID string) (uint64, error) {
+	opts := map[string]interface{}{
+		"StartSuspendedKey": uint64(0),
+		"ActivateSuspended": uint64(1),
+	}
+
+	env := map[string]interface{}{"NSUnbufferedIO": "YES"}
+	return p.StartProcess(bundleID, env, []interface{}{}, opts)
+}
+
 func (p *ProcessControl) Close() error {
 	return p.conn.Close()
 }
