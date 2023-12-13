@@ -2,6 +2,7 @@ package instruments
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/danielpaulus/go-ios/ios"
 	dtx "github.com/danielpaulus/go-ios/ios/dtx_codec"
@@ -29,13 +30,19 @@ func (p *ProcessControl) LaunchApp(bundleID string) (uint64, error) {
 }
 
 // LaunchApp launches the app with ActivateSuspended
-func (p *ProcessControl) LaunchAppWithActivate(bundleID string) (uint64, error) {
+func (p *ProcessControl) LaunchAppWithActivate(bundleID string, envs []string) (uint64, error) {
 	opts := map[string]interface{}{
 		"StartSuspendedKey": uint64(0),
 		"ActivateSuspended": uint64(1),
 	}
 
 	env := map[string]interface{}{"NSUnbufferedIO": "YES"}
+	for i := range envs {
+		parts := strings.Split(envs[i], ":")
+		if len(parts) == 2 {
+			env[parts[0]] = parts[1]
+		}
+	}
 	return p.StartProcess(bundleID, env, []interface{}{}, opts)
 }
 
