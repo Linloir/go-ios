@@ -708,7 +708,7 @@ The commands work as following:
 		if active {
 			pid, err = pControl.LaunchAppWithActivate(bundleID, envs)
 		} else {
-			pid, err = pControl.LaunchApp(bundleID)
+			pid, err = pControl.LaunchApp(bundleID, envs)
 		}
 
 		exitIfError("launch app command failed", err)

@@ -16,7 +16,7 @@ type ProcessControl struct {
 
 // LaunchApp launches the app with the given bundleID on the given device.LaunchApp
 // Use LaunchAppWithArgs for passing arguments and envVars. It returns the PID of the created app process.
-func (p *ProcessControl) LaunchApp(bundleID string) (uint64, error) {
+func (p *ProcessControl) LaunchApp(bundleID string, envs []string) (uint64, error) {
 	opts := map[string]interface{}{
 		"StartSuspendedKey": uint64(0),
 	}
@@ -26,6 +26,12 @@ func (p *ProcessControl) LaunchApp(bundleID string) (uint64, error) {
 	// NSUnbufferedIO seems to make the app send its logs via instruments using the outputReceived:fromProcess:atTime: selector
 	// We'll supply per default to get logs
 	env := map[string]interface{}{"NSUnbufferedIO": "YES"}
+	for i := range envs {
+		parts := strings.Split(envs[i], ":")
+		if len(parts) == 2 {
+			env[parts[0]] = parts[1]
+		}
+	}
 	return p.StartProcess(bundleID, env, []interface{}{}, opts)
 }
 
