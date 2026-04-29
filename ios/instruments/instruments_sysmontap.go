@@ -31,6 +31,54 @@ type sysmontapService struct {
 	msgDispatcher     *sysmontapMsgDispatcher
 }
 
+// NewSysmontapServiceWithAttrs is like NewSysmontapService but lets the
+// caller specify exact procAttrs and sysAttrs lists rather than passing
+// the device's full advertised set. iOS rejects (silently) configurations
+// with too many or invalid attrs and falls back to ktrace-style events,
+// which is why callers reproducing the reference idb top output must use
+// the same curated lists reference idb uses (recovered from strace of
+// reference's setConfig: payload).
+func NewSysmontapServiceWithAttrs(device ios.DeviceEntry, samplingInterval int, procAttrs, sysAttrs []string) (*sysmontapService, error) {
+	deviceInfoService, err := NewDeviceInfoService(device)
+	if err != nil {
+		return nil, err
+	}
+
+	msgDispatcher := newSysmontapMsgDispatcher()
+	dtxConn, err := connectInstrumentsWithMsgDispatcher(device, msgDispatcher)
+	if err != nil {
+		return nil, err
+	}
+
+	processControlChannel := dtxConn.RequestChannelIdentifier(sysmontapName, loggingDispatcher{dtxConn})
+
+	pa := make([]interface{}, len(procAttrs))
+	for i, s := range procAttrs {
+		pa[i] = s
+	}
+	sa := make([]interface{}, len(sysAttrs))
+	for i, s := range sysAttrs {
+		sa[i] = s
+	}
+
+	config := map[string]interface{}{
+		"ur":             samplingInterval,
+		"bm":             0,
+		"procAttrs":      pa,
+		"sysAttrs":       sa,
+		"cpuUsage":       true,
+		"sampleInterval": 1000000000,
+	}
+	_, err = processControlChannel.MethodCall("setConfig:", config)
+	if err != nil {
+		return nil, err
+	}
+	if err := processControlChannel.MethodCallAsync("start"); err != nil {
+		return nil, err
+	}
+	return &sysmontapService{processControlChannel, dtxConn, deviceInfoService, msgDispatcher}, nil
+}
+
 // NewSysmontapService creates a new sysmontapService
 // - samplingInterval is the rate how often to get samples, i.e Xcode's default is 10, which results in sampling output
 // each 1 second, with 500 the samples are retrieved every 15 seconds. It doesn't make any correlation between
@@ -88,6 +136,26 @@ func (s *sysmontapService) Close() error {
 
 	s.deviceInfoService.Close()
 	return s.conn.Close()
+}
+
+// ProcessAttrs returns the attribute list configured for sysmontap (the
+// keys available in each per-process sample). Useful for callers that
+// want to parse RawMessages themselves.
+func (s *sysmontapService) ProcessAttrs() ([]interface{}, error) {
+	return s.deviceInfoService.processAttributes()
+}
+
+// SystemAttrs returns the system attribute keys configured for sysmontap.
+func (s *sysmontapService) SystemAttrs() ([]interface{}, error) {
+	return s.deviceInfoService.systemAttributes()
+}
+
+// RawMessages exposes the underlying DTX message channel. Each sample
+// carries a payload with system samples (Type=1) and per-process arrays
+// (Type=5). Callers can use this to drive richer monitors than
+// ReceiveCPUUsage exposes.
+func (s *sysmontapService) RawMessages() <-chan dtx.Message {
+	return s.msgDispatcher.messages
 }
 
 // ReceiveCPUUsage returns a chan of SysmontapMessage with CPU Usage info

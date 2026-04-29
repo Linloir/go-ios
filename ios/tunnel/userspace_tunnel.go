@@ -230,17 +230,34 @@ func listenToConns(iface UserSpaceTUNInterface, listener net.Listener) error {
 		if err != nil {
 			return err
 		}
-		slog.Info("Received connection request", "from", client.RemoteAddr(), "to", client.LocalAddr())
-		remoteAddrBytes := make([]byte, 16)
-		_, err = client.Read(remoteAddrBytes)
-		if err != nil {
-			return err
-		}
+		// Handle each client in its own goroutine so a single client's
+		// preamble error doesn't tear down the entire listen loop and
+		// leave the userspace TUN port unable to accept future
+		// connections.
+		go handleUserspaceClient(iface, client)
+	}
+}
 
-		remotePortBytes := make([]byte, 4)
-		_, err = client.Read(remotePortBytes)
-		port := binary.LittleEndian.Uint32(remotePortBytes)
-		slog.Info("Received connection request to device ", "ip", net.IP(remoteAddrBytes), "port", port)
-		go iface.TunnelRWCThroughInterface(0, net.IP(remoteAddrBytes), uint16(port), client)
+func handleUserspaceClient(iface UserSpaceTUNInterface, client net.Conn) {
+	slog.Info("Received connection request", "from", client.RemoteAddr(), "to", client.LocalAddr())
+	// Defensive deadline so a stalled / partial-handshake client cannot
+	// pin a goroutine forever before sending the 20-byte preamble.
+	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+	preamble := make([]byte, 20)
+	if _, err := io.ReadFull(client, preamble); err != nil {
+		slog.Debug("userspace TUN: short or failed preamble; dropping client",
+			"err", err)
+		_ = client.Close()
+		return
+	}
+	_ = client.SetReadDeadline(time.Time{})
+
+	remoteAddrBytes := preamble[:16]
+	port := binary.LittleEndian.Uint32(preamble[16:])
+	slog.Info("Received connection request to device ", "ip", net.IP(remoteAddrBytes), "port", port)
+	// TunnelRWCThroughInterface owns Close on client.
+	if err := iface.TunnelRWCThroughInterface(0, net.IP(remoteAddrBytes), uint16(port), client); err != nil {
+		slog.Debug("userspace TUN forward error", "err", err)
 	}
 }
