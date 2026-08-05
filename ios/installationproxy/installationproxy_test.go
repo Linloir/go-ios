@@ -36,3 +36,27 @@ func TestCheckFinished(t *testing.T) {
 	assert.Contains(t, err.Error(), "signature is invalid")
 	assert.True(t, done)
 }
+
+func TestBrowseAppsWithAttributes(t *testing.T) {
+	attributes := []string{CFBundleIdentifier, SignerIdentity}
+	request := browseAppsWithAttributes("User", true, attributes)
+
+	assert.Equal(t, "Browse", request["Command"])
+	options, ok := request["ClientOptions"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "User", options["ApplicationType"])
+	assert.Equal(t, true, options["ShowLaunchProhibitedApps"])
+	assert.Equal(t, attributes, options["ReturnAttributes"])
+
+	// The request owns its slice so callers cannot mutate an in-flight payload.
+	attributes[0] = "changed"
+	assert.Equal(t, []string{CFBundleIdentifier, SignerIdentity}, options["ReturnAttributes"])
+}
+
+func TestBrowseAppsWithoutAttributesKeepsUpstreamRequestShape(t *testing.T) {
+	request := browseApps("User", true)
+	options, ok := request["ClientOptions"].(map[string]any)
+	require.True(t, ok)
+	_, present := options["ReturnAttributes"]
+	assert.False(t, present)
+}

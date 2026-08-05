@@ -116,3 +116,9 @@ func isPermissionDeniedError(err error) bool {
 	var aError afcError
 	return errors.As(err, &aError) && aError.code == errPermDenied
 }
+
+// IsObjectNotFound reports whether err is an AFC ObjectNotFound status.
+func IsObjectNotFound(err error) bool {
+	var aError afcError
+	return errors.As(err, &aError) && aError.code == errObjectNotFound
+}

@@ -32,6 +32,7 @@ const (
 	// MinimumOSVersion defines the minimum supported iOS version
 	MinimumOSVersion = "MinimumOSVersion"
 	Path             = "Path"
+	SignerIdentity   = "SignerIdentity"
 	// UIDeviceFamily slice of integers for supported devices types where a value of '1' means iPhone, and '2' iPad
 	UIDeviceFamily       = "UIDeviceFamily"
 	UIFileSharingEnabled = "UIFileSharingEnabled"
@@ -56,6 +57,13 @@ func New(device ios.DeviceEntry) (*Connection, error) {
 
 func (conn *Connection) BrowseUserApps() ([]AppInfo, error) {
 	return conn.browseApps(browseApps("User", true))
+}
+
+// BrowseUserAppsWithAttributes browses user applications while explicitly
+// requesting the supplied installation-proxy attributes. Some iOS versions do
+// not include fields such as SignerIdentity unless ReturnAttributes is set.
+func (conn *Connection) BrowseUserAppsWithAttributes(attributes []string) ([]AppInfo, error) {
+	return conn.browseApps(browseAppsWithAttributes("User", true, attributes))
 }
 
 func (conn *Connection) BrowseSystemApps() ([]AppInfo, error) {
@@ -210,12 +218,19 @@ func plistFromBytes(plistBytes []byte) (BrowseResponse, error) {
 }
 
 func browseApps(applicationType string, showLaunchProhibitedApps bool) map[string]interface{} {
+	return browseAppsWithAttributes(applicationType, showLaunchProhibitedApps, nil)
+}
+
+func browseAppsWithAttributes(applicationType string, showLaunchProhibitedApps bool, attributes []string) map[string]interface{} {
 	clientOptions := map[string]any{}
 	if applicationType != "" && applicationType != "Filesharing" {
 		clientOptions["ApplicationType"] = applicationType
 	}
 	if showLaunchProhibitedApps {
 		clientOptions["ShowLaunchProhibitedApps"] = true
+	}
+	if attributes != nil {
+		clientOptions["ReturnAttributes"] = append([]string(nil), attributes...)
 	}
 	return map[string]interface{}{"ClientOptions": clientOptions, "Command": "Browse"}
 }

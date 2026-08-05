@@ -261,10 +261,12 @@ func buildAppLaunchPayload(deviceId string, bundleId string, args []interface{},
 			"standardIOUsesPseudoterminals": true,
 			"startStopped":                  false,
 			"terminateExisting":             terminateExisting,
+			"terminationHandler": map[string]interface{}{
+				"sideChannel": uuid.New(),
+			},
 			"user": map[string]interface{}{
 				"active": true,
 			},
-			"workingDirectory": nil,
 		},
 		"standardIOIdentifiers": stdIo,
 	})
