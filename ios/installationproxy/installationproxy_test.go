@@ -60,3 +60,12 @@ func TestBrowseAppsWithoutAttributesKeepsUpstreamRequestShape(t *testing.T) {
 	_, present := options["ReturnAttributes"]
 	assert.False(t, present)
 }
+
+func TestBrowseAllAppsWithAttributesRequest(t *testing.T) {
+	request := browseAppsWithAttributes("", true, []string{Path, CFBundleExecutable})
+	options, ok := request["ClientOptions"].(map[string]any)
+	require.True(t, ok)
+	_, hasApplicationType := options["ApplicationType"]
+	assert.False(t, hasApplicationType)
+	assert.Equal(t, []string{Path, CFBundleExecutable}, options["ReturnAttributes"])
+}

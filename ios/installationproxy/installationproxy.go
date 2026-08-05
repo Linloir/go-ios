@@ -78,6 +78,12 @@ func (conn *Connection) BrowseAllApps() ([]AppInfo, error) {
 	return conn.browseApps(browseApps("", true))
 }
 
+// BrowseAllAppsWithAttributes browses all applications while explicitly
+// requesting the supplied installation-proxy attributes.
+func (conn *Connection) BrowseAllAppsWithAttributes(attributes []string) ([]AppInfo, error) {
+	return conn.browseApps(browseAppsWithAttributes("", true, attributes))
+}
+
 func (conn *Connection) browseApps(request interface{}) ([]AppInfo, error) {
 	reader := conn.deviceConn.Reader()
 	bytes, err := conn.plistCodec.Encode(request)
