@@ -248,7 +248,9 @@ type FileInfo struct {
 	Type       FileType
 	Mode       uint32
 	Size       int64
+	NLink      string
 	LinkTarget string
+	birthTime  time.Time
 	modTime    time.Time
 }
 
@@ -265,6 +267,13 @@ func (f FileInfo) IsLink() bool {
 // contain a valid st_mtime value.
 func (f FileInfo) ModTime() time.Time {
 	return f.modTime
+}
+
+// BirthTime returns the st_birthtime reported by AFC. AFC encodes this value
+// as nanoseconds since the Unix epoch. A zero time means the response did not
+// contain a valid st_birthtime value.
+func (f FileInfo) BirthTime() time.Time {
+	return f.birthTime
 }
 
 // Stat retrieves information about a given file path
@@ -313,8 +322,14 @@ func parseFileInfo(name string, payload []byte) FileInfo {
 		case "st_mode":
 			mode, _ := strconv.ParseUint(value, 8, 32)
 			info.Mode = uint32(mode)
+		case "st_nlink":
+			info.NLink = value
 		case "st_linktarget":
 			info.LinkTarget = value
+		case "st_birthtime":
+			if nanoseconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+				info.birthTime = time.Unix(0, nanoseconds)
+			}
 		case "st_mtime":
 			if nanoseconds, err := strconv.ParseInt(value, 10, 64); err == nil {
 				info.modTime = time.Unix(0, nanoseconds)
