@@ -13,22 +13,45 @@ import (
 
 const serviceName = "com.apple.mobile.house_arrest"
 
+const (
+	vendContainerCommand = "VendContainer"
+	vendDocumentsCommand = "VendDocuments"
+)
+
 func New(device ios.DeviceEntry, bundleID string) (*afc.Client, error) {
+	return NewContainer(device, bundleID)
+}
+
+// NewContainer vends the complete sandbox container. This is available for
+// development-signed applications.
+func NewContainer(device ios.DeviceEntry, bundleID string) (*afc.Client, error) {
+	return newClient(device, bundleID, vendContainerCommand)
+}
+
+// NewDocuments vends the Documents directory. App Store and enterprise-signed
+// applications expose this path when file sharing is enabled, but do not allow
+// VendContainer.
+func NewDocuments(device ios.DeviceEntry, bundleID string) (*afc.Client, error) {
+	return newClient(device, bundleID, vendDocumentsCommand)
+}
+
+func newClient(device ios.DeviceEntry, bundleID, command string) (*afc.Client, error) {
 	deviceConn, err := ios.ConnectToService(device, serviceName)
 	if err != nil {
 		return nil, err
 	}
-	err = vendContainer(deviceConn, bundleID)
+	err = vend(deviceConn, bundleID, command)
 	if err != nil {
+		_ = deviceConn.Close()
 		return nil, err
 	}
 	return afc.NewFromConn(deviceConn), nil
 }
 
-func vendContainer(deviceConn ios.DeviceConnectionInterface, bundleID string) error {
+func vend(deviceConn ios.DeviceConnectionInterface, bundleID, command string) error {
 	plistCodec := ios.NewPlistCodec()
-	vendContainer := map[string]interface{}{"Command": "VendContainer", "Identifier": bundleID}
-	msg, err := plistCodec.Encode(vendContainer)
+	request := buildVendRequest(bundleID, command)
+	msg, err := plistCodec.Encode(request)
 	if err != nil {
 		return fmt.Errorf("vendContainer Encoding cannot fail unless the encoder is broken: %v", err)
 	}
@@ -42,6 +65,10 @@ func vendContainer(deviceConn ios.DeviceConnectionInterface, bundleID string) er
 		return err
 	}
 	return checkResponse(response)
+}
+
+func buildVendRequest(bundleID, command string) map[string]interface{} {
+	return map[string]interface{}{"Command": command, "Identifier": bundleID}
 }
 
 func checkResponse(vendContainerResponseBytes []byte) error {
