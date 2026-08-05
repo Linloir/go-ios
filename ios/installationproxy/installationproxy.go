@@ -76,17 +76,22 @@ func (conn *Connection) browseApps(request interface{}) ([]AppInfo, error) {
 	if err != nil {
 		return make([]AppInfo, 0), err
 	}
-	conn.deviceConn.Send(bytes)
+	if err := conn.deviceConn.Send(bytes); err != nil {
+		return make([]AppInfo, 0), err
+	}
 	stillReceiving := true
 	responses := make([]BrowseResponse, 0)
 	size := uint64(0)
 	for stillReceiving {
 		response, err := conn.plistCodec.Decode(reader)
-		ifa, err := plistFromBytes(response)
-		stillReceiving = "Complete" != ifa.Status
 		if err != nil {
 			return make([]AppInfo, 0), err
 		}
+		ifa, err := plistFromBytes(response)
+		if err != nil {
+			return make([]AppInfo, 0), err
+		}
+		stillReceiving = "Complete" != ifa.Status
 		size += ifa.CurrentAmount
 		responses = append(responses, ifa)
 	}
@@ -96,6 +101,49 @@ func (conn *Connection) browseApps(request interface{}) ([]AppInfo, error) {
 		copy(appinfos[v.CurrentIndex:], v.CurrentList)
 	}
 	return appinfos, nil
+}
+
+// Install asks installation_proxy to install a package that has already been
+// copied to the device (normally below PublicStaging). It waits for the final
+// Complete status and returns any device-reported installation error.
+func (c *Connection) Install(packagePath string, options map[string]interface{}) error {
+	if options == nil {
+		options = map[string]interface{}{}
+	}
+	command := buildInstallCommand(packagePath, options)
+	b, err := c.plistCodec.Encode(command)
+	if err != nil {
+		return err
+	}
+	if err := c.deviceConn.Send(b); err != nil {
+		return err
+	}
+
+	for {
+		response, err := c.plistCodec.Decode(c.deviceConn.Reader())
+		if err != nil {
+			return err
+		}
+		dict, err := ios.ParsePlist(response)
+		if err != nil {
+			return err
+		}
+		done, err := checkFinished(dict)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+	}
+}
+
+func buildInstallCommand(packagePath string, options map[string]interface{}) map[string]interface{} {
+	return map[string]interface{}{
+		"Command":       "Install",
+		"PackagePath":   packagePath,
+		"ClientOptions": options,
+	}
 }
 
 func (c *Connection) Uninstall(bundleId string) error {
@@ -134,14 +182,17 @@ func (c *Connection) Uninstall(bundleId string) error {
 
 func checkFinished(dict map[string]interface{}) (bool, error) {
 	if val, ok := dict["Error"]; ok {
-		return true, fmt.Errorf("received uninstall error: %v", val)
+		if description, ok := dict["ErrorDescription"]; ok {
+			return true, fmt.Errorf("received installation proxy error: %v: %v", val, description)
+		}
+		return true, fmt.Errorf("received installation proxy error: %v", val)
 	}
 	if val, ok := dict["Status"]; ok {
 		if "Complete" == val {
-			log.Info("done uninstalling")
+			log.Info("installation proxy operation complete")
 			return true, nil
 		}
-		log.Infof("uninstall status: %s", val)
+		log.Infof("installation proxy status: %v", val)
 		return false, nil
 	}
 	return true, fmt.Errorf("unknown status update: %+v", dict)

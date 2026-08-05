@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/danielpaulus/go-ios/ios"
 	"golang.org/x/exp/slices"
@@ -237,7 +238,7 @@ type FileType string
 const (
 	// S_IFDIR marks a directory
 	S_IFDIR FileType = "S_IFDIR"
-	// S_IFDIR marks a regular file
+	// S_IFMT marks a regular file
 	S_IFMT  FileType = "S_IFMT"
 	S_IFLNK FileType = "S_IFLNK"
 )
@@ -248,6 +249,7 @@ type FileInfo struct {
 	Mode       uint32
 	Size       int64
 	LinkTarget string
+	modTime    time.Time
 }
 
 func (f FileInfo) IsDir() bool {
@@ -256,6 +258,13 @@ func (f FileInfo) IsDir() bool {
 
 func (f FileInfo) IsLink() bool {
 	return f.Type == S_IFLNK
+}
+
+// ModTime returns the st_mtime reported by AFC. AFC encodes this value as
+// nanoseconds since the Unix epoch. A zero time means the response did not
+// contain a valid st_mtime value.
+func (f FileInfo) ModTime() time.Time {
+	return f.modTime
 }
 
 // Stat retrieves information about a given file path
@@ -270,7 +279,11 @@ func (c *Client) Stat(s string) (FileInfo, error) {
 		return FileInfo{}, fmt.Errorf("error getting file info: %w", err)
 	}
 
-	reader := bufio.NewReader(bytes.NewReader(resp.Payload))
+	return parseFileInfo(s, resp.Payload), nil
+}
+
+func parseFileInfo(name string, payload []byte) FileInfo {
+	reader := bufio.NewReader(bytes.NewReader(payload))
 	info := FileInfo{}
 
 	// Parse the file info response which is a series of null-terminated strings
@@ -302,16 +315,20 @@ func (c *Client) Stat(s string) (FileInfo, error) {
 			info.Mode = uint32(mode)
 		case "st_linktarget":
 			info.LinkTarget = value
+		case "st_mtime":
+			if nanoseconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+				info.modTime = time.Unix(0, nanoseconds)
+			}
 		}
 	}
 
 	// Set the name from the path
-	parts := strings.Split(s, "/")
+	parts := strings.Split(name, "/")
 	if len(parts) > 0 {
 		info.Name = parts[len(parts)-1]
 	}
 
-	return info, nil
+	return info
 }
 
 // WalkDir traverses the filesystem starting at the provided path

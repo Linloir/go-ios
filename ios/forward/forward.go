@@ -17,8 +17,10 @@ type iosproxy struct {
 }
 
 type ConnListener struct {
-	listener net.Listener
-	quit     chan interface{}
+	listener  net.Listener
+	quit      chan struct{}
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Forward forwards every connection made to the hostPort to whatever service runs inside an app on the device on phonePort.
@@ -30,14 +32,15 @@ func Forward(device ios.DeviceEntry, hostPort uint16, phonePort uint16) (*ConnLi
 	if phonePort == 0 {
 		return nil, fmt.Errorf("forward: invalid target port: port must be at least 1")
 	}
-	log.Infof("Start listening on port %d forwarding to port %d on device", hostPort, phonePort)
-	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", hostPort))
+	listenAddress := forwardListenAddress(hostPort)
+	log.Infof("Start listening on %s forwarding to port %d on device", listenAddress, phonePort)
+	l, err := net.Listen("tcp", listenAddress)
 	if err != nil {
 		return nil, fmt.Errorf("forward: failed listener with err: %w", err)
 	}
 	cl := &ConnListener{
 		listener: l,
-		quit:     make(chan interface{}),
+		quit:     make(chan struct{}),
 	}
 
 	go connectionAccept(cl, device.DeviceID, phonePort)
@@ -45,16 +48,19 @@ func Forward(device ios.DeviceEntry, hostPort uint16, phonePort uint16) (*ConnLi
 	return cl, nil
 }
 
+func forwardListenAddress(hostPort uint16) string {
+	return net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", hostPort))
+}
+
 // Close stops listening on the host port for the forwarded connection
 func (cl *ConnListener) Close() error {
-	close(cl.quit)
-
-	err := cl.listener.Close()
-	if err != nil {
-		return fmt.Errorf("forward: failed closing listener with err: %w", err)
-	}
-
-	return nil
+	cl.closeOnce.Do(func() {
+		close(cl.quit)
+		if err := cl.listener.Close(); err != nil {
+			cl.closeErr = fmt.Errorf("forward: failed closing listener with err: %w", err)
+		}
+	})
+	return cl.closeErr
 }
 
 func connectionAccept(cl *ConnListener, deviceID int, phonePort uint16) {
@@ -66,6 +72,11 @@ func connectionAccept(cl *ConnListener, deviceID int, phonePort uint16) {
 		default:
 			clientConn, err := cl.listener.Accept()
 			if err != nil {
+				select {
+				case <-cl.quit:
+					return
+				default:
+				}
 				log.Errorf("Error accepting new connection %v", err)
 				continue
 			}
@@ -79,58 +90,51 @@ func StartNewProxyConnection(ctx context.Context, clientConn io.ReadWriteCloser,
 	usbmuxConn, err := ios.NewUsbMuxConnectionSimple()
 	if err != nil {
 		log.Errorf("could not connect to usbmuxd: %+v", err)
-		clientConn.Close()
-		return fmt.Errorf("could not connect to usbmuxd: %v", err)
+		_ = clientConn.Close()
+		return fmt.Errorf("could not connect to usbmuxd: %w", err)
 	}
 	muxError := usbmuxConn.Connect(deviceID, phonePort)
 	if muxError != nil {
 		log.WithFields(log.Fields{"conn": fmt.Sprintf("%#v", clientConn), "err": muxError, "phonePort": phonePort}).Infof("could not connect to phone")
-		clientConn.Close()
-		return fmt.Errorf("could not connect to port:%d on iOS: %v", phonePort, err)
+		_ = clientConn.Close()
+		_ = usbmuxConn.Close()
+		return fmt.Errorf("could not connect to port:%d on iOS: %w", phonePort, muxError)
 	}
 	log.WithFields(log.Fields{"conn": fmt.Sprintf("%#v", clientConn), "phonePort": phonePort}).Infof("Connected to port")
 	deviceConn := usbmuxConn.ReleaseDeviceConnection()
 
-	// proxyConn := iosproxy{clientConn, deviceConn}
-	ctx2, cancel := context.WithCancel(ctx)
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	closed := false
-	go func() {
-		io.Copy(clientConn, deviceConn.Reader())
-		if ctx2.Err() == nil {
-			cancel()
-			clientConn.Close()
-			deviceConn.Close()
-			closed = true
-		}
-
-		log.Errorf("forward: close clientConn <-- deviceConn")
-		wg.Done()
-	}()
-
-	wg.Add(1)
-	go func() {
-		io.Copy(deviceConn.Writer(), clientConn)
-		if ctx2.Err() == nil {
-			cancel()
-			clientConn.Close()
-			deviceConn.Close()
-			closed = true
-		}
-
-		log.Errorf("forward: close clientConn --> deviceConn")
-		wg.Done()
-	}()
-
-	<-ctx2.Done()
-	if !closed {
-		clientConn.Close()
-		deviceConn.Close()
+	var closeOnce sync.Once
+	closeConnections := func() {
+		closeOnce.Do(func() {
+			_ = clientConn.Close()
+			_ = deviceConn.Close()
+		})
 	}
+	defer closeConnections()
 
-	wg.Wait()
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+	copyConnection := func(direction string, dst io.Writer, src io.Reader) {
+		defer wg.Done()
+		if _, err := io.Copy(dst, src); err != nil {
+			log.WithError(err).Debugf("forward: copy failed %s", direction)
+		}
+		closeConnections()
+	}
+	wg.Add(2)
+	go copyConnection("client <-- device", clientConn, deviceConn.Reader())
+	go copyConnection("client --> device", deviceConn.Writer(), clientConn)
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-ctx.Done():
+		closeConnections()
+		<-done
+	case <-done:
+	}
 	return nil
 }
 

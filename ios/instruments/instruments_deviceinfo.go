@@ -14,11 +14,12 @@ const deviceInfoServiceName = "com.apple.instruments.server.services.deviceinfo"
 // ProcessInfo contains all the properties for a process
 // running on an iOS devices that we get back from instruments
 type ProcessInfo struct {
-	IsApplication bool
-	Name          string
-	Pid           uint64
-	RealAppName   string
-	StartDate     time.Time
+	IsApplication    bool
+	Name             string
+	Pid              uint64
+	RealAppName      string
+	BundleIdentifier string
+	StartDate        time.Time
 }
 
 // processAttributes returns the attributes list which can be used for monitoring
@@ -105,6 +106,9 @@ func mapToProcInfo(procList []interface{}) []ProcessInfo {
 		procInf.Name = procMap["name"].(string)
 		procInf.Pid = procMap["pid"].(uint64)
 		procInf.RealAppName = procMap["realAppName"].(string)
+		if bundleIdentifier, ok := procMap["bundleIdentifier"].(string); ok {
+			procInf.BundleIdentifier = bundleIdentifier
+		}
 		if date, ok := procMap["startDate"]; ok {
 			procInf.StartDate = date.(nskeyedarchiver.NSDate).Timestamp
 		}

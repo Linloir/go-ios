@@ -1,154 +1,231 @@
 package tunnel
 
-//disabled for now
-/*
 import (
 	"context"
+	"errors"
+	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Masterminds/semver"
 	"github.com/danielpaulus/go-ios/ios"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
-func TestSuccessStartForMultipleConnectedDevices(t *testing.T) {
-	tm, ts, dl := setupTunnelManager()
+func TestTunnelManagerSerializesUpdates(t *testing.T) {
+	lister := &concurrencyDetectingDeviceLister{}
+	manager := NewTunnelManager(PairRecordManager{}, false)
+	manager.dl = lister
 
-	d1 := ios.DeviceEntry{
-		Properties: ios.DeviceProperties{
-			SerialNumber: "serial1",
-		},
+	const updates = 24
+	var wg sync.WaitGroup
+	errs := make(chan error, updates)
+	for i := 0; i < updates; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- manager.UpdateTunnels(context.Background())
+		}()
 	}
-	d2 := ios.DeviceEntry{
-		Properties: ios.DeviceProperties{
-			SerialNumber: "serial2",
-		},
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
 	}
+	assert.Equal(t, int64(1), lister.maxActive.Load())
+	assert.True(t, manager.FirstUpdateCompleted())
+}
 
-	dl.On("ListDevices").Return(ios.DeviceList{DeviceList: []ios.DeviceEntry{d1, d2}}, nil)
-
-	ts.On("StartTunnel", mock.Anything, d1, mock.Anything).Return(Tunnel{
-		Address: "addr1",
-		RsdPort: 1,
-		Udid:    "serial1",
-	}, nil)
-	ts.On("StartTunnel", mock.Anything, d2, mock.Anything).Return(Tunnel{
-		Address: "addr2",
-		RsdPort: 2,
-		Udid:    "serial2",
-	}, nil)
-
-	err := tm.UpdateTunnels(context.Background())
-	assert.NoError(t, err)
-
-	tunnels, err := tm.ListTunnels()
-
-	assert.Contains(t, tunnels, Tunnel{
-		Address: "addr1",
-		RsdPort: 1,
-		Udid:    "serial1",
+func TestTunnelManagerDoesNotReportReadyAfterTunnelStartFailure(t *testing.T) {
+	wantErr := errors.New("start failed")
+	device := ios.DeviceEntry{Properties: ios.DeviceProperties{SerialNumber: "device"}}
+	manager := NewTunnelManager(PairRecordManager{}, false)
+	manager.dl = staticDeviceLister{devices: ios.DeviceList{DeviceList: []ios.DeviceEntry{device}}}
+	manager.getProductVersion = func(ios.DeviceEntry) (*semver.Version, error) {
+		return semver.MustParse("17.5.0"), nil
+	}
+	manager.ts = tunnelStarterFunc(func(context.Context, ios.DeviceEntry, PairRecordManager, *semver.Version, bool) (Tunnel, error) {
+		return Tunnel{}, wantErr
 	})
-	assert.Contains(t, tunnels, Tunnel{
-		Address: "addr2",
-		RsdPort: 2,
-		Udid:    "serial2",
+
+	err := manager.UpdateTunnels(context.Background())
+	assert.ErrorIs(t, err, wantErr)
+	assert.False(t, manager.FirstUpdateCompleted())
+}
+
+func TestTunnelManagerBecomesReadyAfterFailedTunnelIsStarted(t *testing.T) {
+	wantErr := errors.New("start failed")
+	device := ios.DeviceEntry{Properties: ios.DeviceProperties{SerialNumber: "device"}}
+	manager := NewTunnelManager(PairRecordManager{}, false)
+	manager.dl = staticDeviceLister{devices: ios.DeviceList{DeviceList: []ios.DeviceEntry{device}}}
+	manager.getProductVersion = func(ios.DeviceEntry) (*semver.Version, error) {
+		return semver.MustParse("17.5.0"), nil
+	}
+	var attempts atomic.Int64
+	manager.ts = tunnelStarterFunc(func(context.Context, ios.DeviceEntry, PairRecordManager, *semver.Version, bool) (Tunnel, error) {
+		if attempts.Add(1) == 1 {
+			return Tunnel{}, wantErr
+		}
+		return Tunnel{closer: func() error { return nil }}, nil
 	})
+
+	assert.ErrorIs(t, manager.UpdateTunnels(context.Background()), wantErr)
+	assert.False(t, manager.FirstUpdateCompleted())
+	require.NoError(t, manager.UpdateTunnels(context.Background()))
+	assert.True(t, manager.FirstUpdateCompleted())
+	tunnel, err := manager.FindTunnel("device")
+	require.NoError(t, err)
+	assert.Equal(t, "device", tunnel.Udid)
 }
 
-func TestCloseTunnelsOnDisconnect(t *testing.T) {
-	tm, ts, dl := setupTunnelManager()
+func TestTunnelManagerUserspacePortAllocationIsConcurrentSafe(t *testing.T) {
+	manager := NewTunnelManager(PairRecordManager{}, true)
+	const allocations = 256
+	ports := make(chan int, allocations)
 
-	d1 := ios.DeviceEntry{
-		Properties: ios.DeviceProperties{
-			SerialNumber: "serial",
-		},
+	var wg sync.WaitGroup
+	for i := 0; i < allocations; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ports <- manager.nextUserspaceTUNPort()
+		}()
 	}
-	var closerCalls atomic.Uint64
-	closer := func() error {
-		closerCalls.Add(1)
-		return nil
+	wg.Wait()
+	close(ports)
+
+	unique := make(map[int]struct{}, allocations)
+	for port := range ports {
+		if _, exists := unique[port]; exists {
+			t.Fatalf("duplicate userspace TUN port allocated: %d", port)
+		}
+		unique[port] = struct{}{}
+	}
+	assert.Len(t, unique, allocations)
+}
+
+func TestTunnelManagerConcurrentListFindAndRemove(t *testing.T) {
+	manager := NewTunnelManager(PairRecordManager{}, false)
+	const tunnelCount = 32
+	var closeCalls atomic.Int64
+	errs := make(chan error, 8*500+tunnelCount)
+	for i := 0; i < tunnelCount; i++ {
+		udid := fmt.Sprintf("device-%d", i)
+		manager.tunnels[udid] = Tunnel{
+			Udid: udid,
+			closer: func() error {
+				closeCalls.Add(1)
+				return nil
+			},
+		}
 	}
 
-	dl.On("ListDevices").
-		Return(ios.DeviceList{DeviceList: []ios.DeviceEntry{d1}}, nil).
-		Once()
-	ts.On("StartTunnel", mock.Anything, d1, mock.Anything).Return(Tunnel{
-		Address: "addr1",
-		RsdPort: 1,
-		closer:  closer,
-	}, nil)
-
-	err := tm.UpdateTunnels(context.Background())
-	assert.NoError(t, err)
-
-	tunnels, _ := tm.ListTunnels()
-	assert.Len(t, tunnels, 1)
-
-	dl.On("ListDevices").
-		Return(ios.DeviceList{}, nil).
-		Once()
-
-	err = tm.UpdateTunnels(context.Background())
-	assert.NoError(t, err)
-	tunnels, _ = tm.ListTunnels()
-	assert.Len(t, tunnels, 0)
-	assert.GreaterOrEqual(t, closerCalls.Load(), uint64(1))
-}
-
-func TestBridgeIsOnlyStarteOnce(t *testing.T) {
-	tm, ts, dl := setupTunnelManager()
-
-	d1 := ios.DeviceEntry{
-		Properties: ios.DeviceProperties{
-			SerialNumber: "serial",
-		},
+	var wg sync.WaitGroup
+	for reader := 0; reader < 8; reader++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 500; i++ {
+				_, err := manager.ListTunnels()
+				if err != nil {
+					errs <- err
+				}
+				_, err = manager.FindTunnel(fmt.Sprintf("device-%d", i%tunnelCount))
+				if err != nil {
+					errs <- err
+				}
+				_ = manager.FirstUpdateCompleted()
+			}
+		}()
+	}
+	for i := 0; i < tunnelCount; i++ {
+		udid := fmt.Sprintf("device-%d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := manager.RemoveTunnel(context.Background(), udid); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
 	}
 
-	closer := func() error { return nil }
-	dl.On("ListDevices").
-		Return(ios.DeviceList{DeviceList: []ios.DeviceEntry{d1}}, nil)
-	ts.On("StartTunnel", mock.Anything, d1, mock.Anything).Return(Tunnel{
-		Address: "addr1",
-		RsdPort: 1,
-		closer:  closer,
-	}, nil)
-
-	err := tm.UpdateTunnels(context.Background())
-	assert.NoError(t, err)
-	err = tm.UpdateTunnels(context.Background())
-	assert.NoError(t, err)
-
-	ts.AssertNumberOfCalls(t, "StartTunnel", 1)
+	tunnels, err := manager.ListTunnels()
+	require.NoError(t, err)
+	assert.Empty(t, tunnels)
+	assert.Equal(t, int64(tunnelCount), closeCalls.Load())
 }
 
-func setupTunnelManager() (*TunnelManager, *tunnelStarterMock, *deviceListerMock) {
-	ts := new(tunnelStarterMock)
-	dl := new(deviceListerMock)
+func TestTunnelManagerCloseIsIdempotentAndPreservesError(t *testing.T) {
+	wantErr := errors.New("close failed")
+	manager := NewTunnelManager(PairRecordManager{}, false)
+	manager.tunnels["device"] = Tunnel{
+		Udid:   "device",
+		closer: func() error { return wantErr },
+	}
 
-	return &TunnelManager{
-		ts:      ts,
-		dl:      dl,
-		tunnels: map[string]Tunnel{},
-	}, ts, dl
+	assert.ErrorIs(t, manager.Close(), wantErr)
+	assert.ErrorIs(t, manager.Close(), wantErr)
+	tunnels, err := manager.ListTunnels()
+	require.NoError(t, err)
+	assert.Empty(t, tunnels)
+	assert.Error(t, manager.UpdateTunnels(context.Background()))
 }
 
-type tunnelStarterMock struct {
-	mock.Mock
+func TestStopTunnelClosesCurrentMapEntry(t *testing.T) {
+	manager := NewTunnelManager(PairRecordManager{}, false)
+	var staleCloseCalls atomic.Int64
+	var currentCloseCalls atomic.Int64
+	stale := Tunnel{
+		Udid:   "device",
+		closer: func() error { staleCloseCalls.Add(1); return nil },
+	}
+	manager.tunnels["device"] = Tunnel{
+		Udid:   "device",
+		closer: func() error { currentCloseCalls.Add(1); return nil },
+	}
+
+	require.NoError(t, manager.stopTunnel(stale))
+	assert.Zero(t, staleCloseCalls.Load())
+	assert.Equal(t, int64(1), currentCloseCalls.Load())
 }
 
-func (t *tunnelStarterMock) StartTunnel(ctx context.Context, device ios.DeviceEntry, p PairRecordManager, version *semver.Version) (Tunnel, error) {
-	args := t.Mock.Called(ctx, device, p)
-	return args.Get(0).(Tunnel), args.Error(1)
+type concurrencyDetectingDeviceLister struct {
+	active    atomic.Int64
+	maxActive atomic.Int64
 }
 
-type deviceListerMock struct {
-	mock.Mock
+type staticDeviceLister struct {
+	devices ios.DeviceList
+	err     error
 }
 
-func (d *deviceListerMock) ListDevices() (ios.DeviceList, error) {
-	args := d.Called()
-	return args.Get(0).(ios.DeviceList), args.Error(1)
+func (l staticDeviceLister) ListDevices() (ios.DeviceList, error) {
+	return l.devices, l.err
 }
-*/
+
+type tunnelStarterFunc func(context.Context, ios.DeviceEntry, PairRecordManager, *semver.Version, bool) (Tunnel, error)
+
+func (f tunnelStarterFunc) StartTunnel(ctx context.Context, device ios.DeviceEntry, pairRecordManager PairRecordManager, version *semver.Version, userspaceTUN bool) (Tunnel, error) {
+	return f(ctx, device, pairRecordManager, version, userspaceTUN)
+}
+
+func (l *concurrencyDetectingDeviceLister) ListDevices() (ios.DeviceList, error) {
+	active := l.active.Add(1)
+	defer l.active.Add(-1)
+	for {
+		max := l.maxActive.Load()
+		if active <= max || l.maxActive.CompareAndSwap(max, active) {
+			break
+		}
+	}
+	time.Sleep(time.Millisecond)
+	return ios.DeviceList{}, nil
+}

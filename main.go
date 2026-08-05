@@ -114,7 +114,7 @@ Usage:
   ios ip [options]
   ios kill (<bundleID> | --pid=<processID> | --process=<processName>) [options]
   ios lang [--setlocale=<locale>] [--setlang=<newlang>] [options]
-  ios launch <bundleID> [--wait] [--kill-existing] [--arg=<a>]... [--env=<e>]... [options]
+  ios launch <bundleID> [--wait] [--kill-existing] [--active] [--arg=<a>]... [--env=<e>]... [options]
   ios list [options] [--details]
   ios listen [options]
   ios lockdown get [<key>] [--domain=<domain>] [options]
@@ -286,9 +286,10 @@ The commands work as following:
     ios lang [--setlocale=<locale>] [--setlang=<newlang>] [options]    Sets or gets the Device language. ios lang will print the current language and locale,
                                                                        as well as a list of all supported langs and locales.
 
-    ios launch <bundleID> [--wait] [--kill-existing] [--arg=<a>]... [--env=<e>]... [options]
+    ios launch <bundleID> [--wait] [--kill-existing] [--active] [--arg=<a>]... [--env=<e>]... [options]
                                                                        Launch app with the bundleID on the device. Get your bundle ID from the apps command.
                                                                        --wait keeps the connection open if you want logs.
+                                                                       --active asks Instruments to activate an already suspended app.
 
     ios list [options] [--details]                                     Prints a list of all connected device's udids.
                                                                        If --details is specified, it includes version, name and model of each device.
@@ -1069,6 +1070,7 @@ The commands work as following:
 	if b {
 		wait, _ := arguments.Bool("--wait")
 		bKillExisting, _ := arguments.Bool("--kill-existing")
+		activateSuspended, _ := arguments.Bool("--active")
 		bundleID, _ := arguments.String("<bundleID>")
 		if bundleID == "" {
 			log.Fatal("please provide a bundleID")
@@ -1079,6 +1081,9 @@ The commands work as following:
 		if bKillExisting {
 			opts["KillExisting"] = 1
 		} // end if
+		if activateSuspended {
+			opts["ActivateSuspended"] = 1
+		}
 		args := toArgs(arguments["--arg"].([]string))
 		envs := toEnvs(arguments["--env"].([]string))
 		pid, err := pControl.LaunchAppWithArgs(bundleID, args, envs, opts)

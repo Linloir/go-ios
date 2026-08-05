@@ -1,12 +1,84 @@
 package instruments
 
 import (
+	"sync"
 	"testing"
+	"time"
 
 	dtx "github.com/danielpaulus/go-ios/ios/dtx_codec"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBuildSysmontapConfigWithAttrsUsesMilliseconds(t *testing.T) {
+	procAttrs := []interface{}{"pid", "name"}
+	sysAttrs := []interface{}{"physMemSize"}
+	config := buildSysmontapConfigWithAttrs(2500, procAttrs, sysAttrs)
+
+	assert.Equal(t, 2500, config["ur"])
+	assert.Equal(t, int64(2_500_000_000), config["sampleInterval"])
+	assert.Equal(t, procAttrs, config["procAttrs"])
+	assert.Equal(t, sysAttrs, config["sysAttrs"])
+}
+
+func TestSysmontapConfiguredAttrsAreCopied(t *testing.T) {
+	service := &sysmontapService{
+		procAttrs: []interface{}{"pid", "name"},
+		sysAttrs:  []interface{}{"physMemSize"},
+	}
+
+	procAttrs, err := service.ProcessAttrs()
+	require.NoError(t, err)
+	sysAttrs, err := service.SystemAttrs()
+	require.NoError(t, err)
+	procAttrs[0] = "mutated"
+	sysAttrs[0] = "mutated"
+
+	procAttrsAgain, err := service.ProcessAttrs()
+	require.NoError(t, err)
+	sysAttrsAgain, err := service.SystemAttrs()
+	require.NoError(t, err)
+	assert.Equal(t, []interface{}{"pid", "name"}, procAttrsAgain)
+	assert.Equal(t, []interface{}{"physMemSize"}, sysAttrsAgain)
+}
+
+func TestSysmontapDispatcherCloseUnblocksConcurrentDispatch(t *testing.T) {
+	dispatcher := newSysmontapMsgDispatcher()
+	const dispatchCount = 64
+
+	var started sync.WaitGroup
+	var finished sync.WaitGroup
+	started.Add(dispatchCount)
+	finished.Add(dispatchCount)
+	for i := 0; i < dispatchCount; i++ {
+		go func() {
+			defer finished.Done()
+			started.Done()
+			dispatcher.Dispatch(dtx.Message{})
+		}()
+	}
+	started.Wait()
+
+	closed := make(chan struct{})
+	go func() {
+		dispatcher.Close()
+		dispatcher.Close() // idempotent
+		close(closed)
+	}()
+
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("dispatcher Close blocked with unconsumed messages")
+	}
+	finished.Wait()
+	if _, ok := <-dispatcher.messages; ok {
+		t.Fatal("messages channel remained open after Close")
+	}
+
+	// Dispatch after Close must be a no-op rather than a send-on-closed panic.
+	dispatcher.Dispatch(dtx.Message{})
+}
 
 // Helper to build a dtx.Message with the standard sysmontap payload structure.
 func buildSysmontapMsg(resultMap map[string]interface{}) dtx.Message {

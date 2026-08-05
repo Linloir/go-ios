@@ -194,8 +194,11 @@ func connectToUserspaceTunnelLockdown(ctx context.Context, device ios.DeviceEntr
 		return Tunnel{}, fmt.Errorf("could not exchange tunnel parameters. %w", err)
 	}
 	const prefixLength = 64
+	// The lockdown tunnel carries raw IPv6 packets over a TCP byte stream.
+	// Preserve packet boundaries before handing reads to gVisor.
+	framedConn := newFramedIPv6Conn(connToDevice)
 	iface := UserSpaceTUNInterface{}
-	err = iface.Init(uint32(tunnelInfo.ClientParameters.Mtu), connToDevice, tunnelInfo.ClientParameters.Address, prefixLength)
+	err = iface.Init(uint32(tunnelInfo.ClientParameters.Mtu), framedConn, tunnelInfo.ClientParameters.Address, prefixLength)
 	if err != nil {
 		return Tunnel{}, fmt.Errorf("could not setup tunnel interface. %w", err)
 	}

@@ -180,18 +180,26 @@ func (c *Connection) ListProcesses() ([]Process, error) {
 
 // KillProcess kills the process with the given PID for iOS17+.
 func (c *Connection) KillProcess(pid int) error {
-	req := buildSendSignalPayload(c.deviceId, pid, syscall.SIGKILL)
+	if err := c.SendSignal(pid, syscall.SIGKILL); err != nil {
+		return fmt.Errorf("killProcess: %w", err)
+	}
+	return nil
+}
+
+// SendSignal sends signal to the process with the given PID for iOS17+.
+func (c *Connection) SendSignal(pid int, signal syscall.Signal) error {
+	req := buildSendSignalPayload(c.deviceId, pid, signal)
 	err := c.conn.Send(req, xpc.HeartbeatRequestFlag)
 	if err != nil {
-		return fmt.Errorf("killProcess send: %w", err)
+		return fmt.Errorf("sendSignal send: %w", err)
 	}
 	m, err := c.conn.ReceiveOnServerClientStream()
 	if err != nil {
-		return fmt.Errorf("killProcess receive: %w", err)
+		return fmt.Errorf("sendSignal receive: %w", err)
 	}
 	err = getError(m)
 	if err != nil {
-		return fmt.Errorf("killProcess: %w", err)
+		return fmt.Errorf("sendSignal: %w", err)
 	}
 	return nil
 }

@@ -218,12 +218,16 @@ type TunnelManager struct {
 	ts                   tunnelStarter
 	dl                   deviceLister
 	pm                   PairRecordManager
-	mux                  sync.Mutex
+	mux                  sync.RWMutex
+	updateMux            sync.Mutex
 	tunnels              map[string]Tunnel
 	startTunnelTimeout   time.Duration
+	getProductVersion    func(ios.DeviceEntry) (*semver.Version, error)
 	firstUpdateCompleted bool
 	userspaceTUN         bool
 	closeOnce            sync.Once
+	closeErr             error
+	closed               bool
 	portOffset           int
 }
 
@@ -236,66 +240,82 @@ func NewTunnelManager(pm PairRecordManager, userspaceTUN bool) *TunnelManager {
 		pm:                 pm,
 		tunnels:            map[string]Tunnel{},
 		startTunnelTimeout: 10 * time.Second,
+		getProductVersion:  ios.GetProductVersion,
 		userspaceTUN:       userspaceTUN,
 		portOffset:         1,
 	}
 }
 
 func (m *TunnelManager) Close() error {
-	var baseErr error
 	m.closeOnce.Do(func() {
-		tunnels, err := m.ListTunnels()
-		if err != nil {
-			log.Error("failed to list tunnels", err)
-		}
+		// Do not race shutdown against a full device-list update.
+		m.updateMux.Lock()
+		defer m.updateMux.Unlock()
+
+		m.mux.Lock()
+		m.closed = true
+		tunnels := maps.Values(m.tunnels)
+		m.tunnels = map[string]Tunnel{}
+		m.mux.Unlock()
+
 		for _, t := range tunnels {
 			err := t.Close()
-			baseErr = errors.Join(baseErr, err)
+			m.closeErr = errors.Join(m.closeErr, err)
 			if err != nil {
 				log.WithField("udid", t.Udid).Error("failed to stop tunnel", err)
 			}
 		}
 	})
-	return baseErr
+	return m.closeErr
 }
 
 // FirstUpdateCompleted returns true if the first update completed,
 // use it to prevent race conditions when trying to use go-ios agent for the first time
 func (m *TunnelManager) FirstUpdateCompleted() bool {
-	m.mux.Lock()
-	defer m.mux.Unlock()
+	m.mux.RLock()
+	defer m.mux.RUnlock()
 	return m.firstUpdateCompleted
 }
 
 // UpdateTunnels checks for connected devices and starts a new tunnel if needed
 // On device disconnects the tunnel resources get cleaned up
 func (m *TunnelManager) UpdateTunnels(ctx context.Context) error {
+	m.updateMux.Lock()
+	defer m.updateMux.Unlock()
 
-	m.mux.Lock()
+	m.mux.RLock()
+	if m.closed {
+		m.mux.RUnlock()
+		return errors.New("UpdateTunnels: tunnel manager is closed")
+	}
 	localTunnels := map[string]Tunnel{}
 	maps.Copy(localTunnels, m.tunnels)
-	m.mux.Unlock()
+	m.mux.RUnlock()
 
 	devices, err := m.dl.ListDevices()
 	if err != nil {
 		return fmt.Errorf("UpdateTunnels: failed to get list of devices: %w", err)
 	}
+	var updateErr error
 	for _, d := range devices.DeviceList {
 		udid := d.Properties.SerialNumber
 		if _, exists := localTunnels[udid]; exists {
 			continue
 		}
 		if m.userspaceTUN && d.UserspaceTUNPort == 0 {
-			d.UserspaceTUNPort = ios.HttpApiPort() + m.portOffset
-			m.portOffset++
+			d.UserspaceTUNPort = m.nextUserspaceTUNPort()
 		}
 		t, err := m.startTunnel(ctx, d)
 		if err != nil {
+			updateErr = errors.Join(updateErr, fmt.Errorf("start tunnel for %s: %w", udid, err))
 			log.WithField("udid", udid).
 				WithError(err).
 				Warn("failed to start tunnel")
 			continue
 		}
+		// The map key and serialized tunnel identity must always describe the
+		// device we just reconciled, even if a starter omitted the field.
+		t.Udid = udid
 		m.mux.Lock()
 		localTunnels[udid] = t
 		m.tunnels[udid] = t
@@ -306,40 +326,61 @@ func (m *TunnelManager) UpdateTunnels(ctx context.Context) error {
 			return entry.Properties.SerialNumber == udid
 		})
 		if !idx {
-			_ = m.stopTunnel(tun)
+			if err := m.stopTunnel(tun); err != nil {
+				updateErr = errors.Join(updateErr, fmt.Errorf("stop tunnel for %s: %w", udid, err))
+			}
 		}
 	}
-	m.mux.Lock()
-	m.firstUpdateCompleted = true
-	m.mux.Unlock()
-	return nil
+	if updateErr == nil {
+		m.mux.Lock()
+		m.firstUpdateCompleted = true
+		m.mux.Unlock()
+	}
+	return updateErr
 }
 
 func (m *TunnelManager) RemoveTunnel(ctx context.Context, serialNumber string) error {
-	for udid, tun := range m.tunnels {
-		if udid == serialNumber {
-			err := m.stopTunnel(tun)
-			return err
-		}
+	m.mux.RLock()
+	tun, ok := m.tunnels[serialNumber]
+	m.mux.RUnlock()
+	if !ok {
+		return errors.New("tunnel not found")
 	}
-
-	return errors.New("tunnel not found")
+	return m.stopTunnel(tun)
 }
 
 func (m *TunnelManager) stopTunnel(t Tunnel) error {
 	m.mux.Lock()
-	defer m.mux.Unlock()
-	log.WithField("udid", t.Udid).Info("stopping tunnel")
-	delete(m.tunnels, t.Udid)
+	current, exists := m.tunnels[t.Udid]
+	if exists {
+		delete(m.tunnels, t.Udid)
+	}
+	m.mux.Unlock()
+	if !exists {
+		return nil
+	}
 
-	return t.Close()
+	log.WithField("udid", t.Udid).Info("stopping tunnel")
+	return current.Close()
+}
+
+func (m *TunnelManager) nextUserspaceTUNPort() int {
+	m.mux.Lock()
+	defer m.mux.Unlock()
+	port := ios.HttpApiPort() + m.portOffset
+	m.portOffset++
+	return port
 }
 
 func (m *TunnelManager) startTunnel(ctx context.Context, device ios.DeviceEntry) (Tunnel, error) {
 	log.WithField("udid", device.Properties.SerialNumber).Info("start tunnel")
 	startTunnelCtx, cancel := context.WithTimeout(ctx, m.startTunnelTimeout)
 	defer cancel()
-	version, err := ios.GetProductVersion(device)
+	getProductVersion := m.getProductVersion
+	if getProductVersion == nil {
+		getProductVersion = ios.GetProductVersion
+	}
+	version, err := getProductVersion(device)
 	if err != nil {
 		return Tunnel{}, fmt.Errorf("startTunnel: failed to get device version: %w", err)
 	}
@@ -352,23 +393,17 @@ func (m *TunnelManager) startTunnel(ctx context.Context, device ios.DeviceEntry)
 
 // ListTunnels provides all currently running device tunnels
 func (m *TunnelManager) ListTunnels() ([]Tunnel, error) {
-	m.mux.Lock()
-	defer m.mux.Unlock()
+	m.mux.RLock()
+	defer m.mux.RUnlock()
 	return maps.Values(m.tunnels), nil
 }
 
 func (m *TunnelManager) FindTunnel(udid string) (Tunnel, error) {
-	tunnels, err := m.ListTunnels()
-	if err != nil {
-		return Tunnel{}, err
+	m.mux.RLock()
+	defer m.mux.RUnlock()
+	if tunnel, ok := m.tunnels[udid]; ok {
+		return tunnel, nil
 	}
-
-	for _, t := range tunnels {
-		if t.Udid == udid {
-			return t, nil
-		}
-	}
-
 	return Tunnel{}, nil
 }
 

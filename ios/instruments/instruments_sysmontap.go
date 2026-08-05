@@ -3,6 +3,7 @@ package instruments
 import (
 	"fmt"
 	"reflect"
+	"sync"
 
 	"github.com/danielpaulus/go-ios/ios"
 	dtx "github.com/danielpaulus/go-ios/ios/dtx_codec"
@@ -11,14 +12,51 @@ import (
 
 type sysmontapMsgDispatcher struct {
 	messages chan dtx.Message
+	done     chan struct{}
+
+	mu          sync.RWMutex
+	closed      bool
+	dispatching sync.WaitGroup
+	closeOnce   sync.Once
 }
 
 func newSysmontapMsgDispatcher() *sysmontapMsgDispatcher {
-	return &sysmontapMsgDispatcher{make(chan dtx.Message)}
+	return &sysmontapMsgDispatcher{
+		messages: make(chan dtx.Message),
+		done:     make(chan struct{}),
+	}
 }
 
 func (p *sysmontapMsgDispatcher) Dispatch(m dtx.Message) {
-	p.messages <- m
+	// Register the in-flight dispatch while holding the read lock. Close takes
+	// the write lock before it starts waiting, so Wait can never race with Add.
+	p.mu.RLock()
+	if p.closed {
+		p.mu.RUnlock()
+		return
+	}
+	p.dispatching.Add(1)
+	p.mu.RUnlock()
+	defer p.dispatching.Done()
+
+	select {
+	case p.messages <- m:
+	case <-p.done:
+	}
+}
+
+func (p *sysmontapMsgDispatcher) Close() {
+	p.closeOnce.Do(func() {
+		p.mu.Lock()
+		p.closed = true
+		close(p.done)
+		p.mu.Unlock()
+
+		// Closing done releases dispatchers blocked on an unconsumed messages
+		// channel. Once they have all returned, it is safe to close messages.
+		p.dispatching.Wait()
+		close(p.messages)
+	})
 }
 
 const sysmontapName = "com.apple.instruments.server.services.sysmontap"
@@ -29,54 +67,55 @@ type sysmontapService struct {
 
 	deviceInfoService *DeviceInfoService
 	msgDispatcher     *sysmontapMsgDispatcher
+	procAttrs         []interface{}
+	sysAttrs          []interface{}
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // NewSysmontapServiceWithAttrs is like NewSysmontapService but lets the
 // caller specify exact procAttrs and sysAttrs lists rather than passing
-// the device's full advertised set. iOS rejects (silently) configurations
+// the device's full advertised set. samplingInterval is expressed in
+// milliseconds. iOS rejects (silently) configurations
 // with too many or invalid attrs and falls back to ktrace-style events,
 // which is why callers reproducing the reference idb top output must use
 // the same curated lists reference idb uses (recovered from strace of
 // reference's setConfig: payload).
 func NewSysmontapServiceWithAttrs(device ios.DeviceEntry, samplingInterval int, procAttrs, sysAttrs []string) (*sysmontapService, error) {
-	deviceInfoService, err := NewDeviceInfoService(device)
-	if err != nil {
-		return nil, err
-	}
-
 	msgDispatcher := newSysmontapMsgDispatcher()
 	dtxConn, err := connectInstrumentsWithMsgDispatcher(device, msgDispatcher)
 	if err != nil {
+		msgDispatcher.Close()
 		return nil, err
+	}
+	cleanup := func() {
+		msgDispatcher.Close()
+		_ = dtxConn.Close()
 	}
 
 	processControlChannel := dtxConn.RequestChannelIdentifier(sysmontapName, loggingDispatcher{dtxConn})
 
-	pa := make([]interface{}, len(procAttrs))
-	for i, s := range procAttrs {
-		pa[i] = s
-	}
-	sa := make([]interface{}, len(sysAttrs))
-	for i, s := range sysAttrs {
-		sa[i] = s
-	}
+	pa := stringAttrsToInterfaces(procAttrs)
+	sa := stringAttrsToInterfaces(sysAttrs)
 
-	config := map[string]interface{}{
-		"ur":             samplingInterval,
-		"bm":             0,
-		"procAttrs":      pa,
-		"sysAttrs":       sa,
-		"cpuUsage":       true,
-		"sampleInterval": 1000000000,
-	}
+	config := buildSysmontapConfigWithAttrs(samplingInterval, pa, sa)
 	_, err = processControlChannel.MethodCall("setConfig:", config)
 	if err != nil {
+		cleanup()
 		return nil, err
 	}
 	if err := processControlChannel.MethodCallAsync("start"); err != nil {
+		cleanup()
 		return nil, err
 	}
-	return &sysmontapService{processControlChannel, dtxConn, deviceInfoService, msgDispatcher}, nil
+	return &sysmontapService{
+		channel:       processControlChannel,
+		conn:          dtxConn,
+		msgDispatcher: msgDispatcher,
+		procAttrs:     cloneAttrs(pa),
+		sysAttrs:      cloneAttrs(sa),
+	}, nil
 }
 
 // NewSysmontapService creates a new sysmontapService
@@ -93,18 +132,27 @@ func NewSysmontapService(device ios.DeviceEntry, samplingInterval int) (*sysmont
 	msgDispatcher := newSysmontapMsgDispatcher()
 	dtxConn, err := connectInstrumentsWithMsgDispatcher(device, msgDispatcher)
 	if err != nil {
+		deviceInfoService.Close()
+		msgDispatcher.Close()
 		return nil, err
+	}
+	cleanup := func() {
+		msgDispatcher.Close()
+		_ = dtxConn.Close()
+		deviceInfoService.Close()
 	}
 
 	processControlChannel := dtxConn.RequestChannelIdentifier(sysmontapName, loggingDispatcher{dtxConn})
 
 	sysAttrs, err := deviceInfoService.systemAttributes()
 	if err != nil {
+		cleanup()
 		return nil, err
 	}
 
 	procAttrs, err := deviceInfoService.processAttributes()
 	if err != nil {
+		cleanup()
 		return nil, err
 	}
 
@@ -119,35 +167,50 @@ func NewSysmontapService(device ios.DeviceEntry, samplingInterval int) (*sysmont
 	}
 	_, err = processControlChannel.MethodCall("setConfig:", config)
 	if err != nil {
+		cleanup()
 		return nil, err
 	}
 
 	err = processControlChannel.MethodCallAsync("start")
 	if err != nil {
+		cleanup()
 		return nil, err
 	}
 
-	return &sysmontapService{processControlChannel, dtxConn, deviceInfoService, msgDispatcher}, nil
+	return &sysmontapService{
+		channel:           processControlChannel,
+		conn:              dtxConn,
+		deviceInfoService: deviceInfoService,
+		msgDispatcher:     msgDispatcher,
+		procAttrs:         cloneAttrs(procAttrs),
+		sysAttrs:          cloneAttrs(sysAttrs),
+	}, nil
 }
 
 // Close closes up the DTX connection, message dispatcher and dtx.Message channel
 func (s *sysmontapService) Close() error {
-	close(s.msgDispatcher.messages)
-
-	s.deviceInfoService.Close()
-	return s.conn.Close()
+	s.closeOnce.Do(func() {
+		s.msgDispatcher.Close()
+		if s.deviceInfoService != nil {
+			s.deviceInfoService.Close()
+		}
+		if s.conn != nil {
+			s.closeErr = s.conn.Close()
+		}
+	})
+	return s.closeErr
 }
 
 // ProcessAttrs returns the attribute list configured for sysmontap (the
 // keys available in each per-process sample). Useful for callers that
 // want to parse RawMessages themselves.
 func (s *sysmontapService) ProcessAttrs() ([]interface{}, error) {
-	return s.deviceInfoService.processAttributes()
+	return cloneAttrs(s.procAttrs), nil
 }
 
 // SystemAttrs returns the system attribute keys configured for sysmontap.
 func (s *sysmontapService) SystemAttrs() ([]interface{}, error) {
-	return s.deviceInfoService.systemAttributes()
+	return cloneAttrs(s.sysAttrs), nil
 }
 
 // RawMessages exposes the underlying DTX message channel. Each sample
@@ -173,13 +236,40 @@ func (s *sysmontapService) ReceiveCPUUsage() chan SysmontapMessage {
 				continue
 			}
 
-			messages <- sysmontapMessage
+			select {
+			case messages <- sysmontapMessage:
+			case <-s.msgDispatcher.done:
+				return
+			}
 		}
 
 		log.Infof("sysmontap message dispatcher channel closed")
 	}()
 
 	return messages
+}
+
+func stringAttrsToInterfaces(attrs []string) []interface{} {
+	result := make([]interface{}, len(attrs))
+	for i, attr := range attrs {
+		result[i] = attr
+	}
+	return result
+}
+
+func cloneAttrs(attrs []interface{}) []interface{} {
+	return append([]interface{}(nil), attrs...)
+}
+
+func buildSysmontapConfigWithAttrs(samplingInterval int, procAttrs, sysAttrs []interface{}) map[string]interface{} {
+	return map[string]interface{}{
+		"ur":             samplingInterval,
+		"bm":             0,
+		"procAttrs":      procAttrs,
+		"sysAttrs":       sysAttrs,
+		"cpuUsage":       true,
+		"sampleInterval": int64(samplingInterval) * 1_000_000,
+	}
 }
 
 // SysmontapMessage is a wrapper struct for incoming CPU samples
