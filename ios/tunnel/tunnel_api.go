@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,77 +28,351 @@ var netClient = &http.Client{
 	Timeout: time.Millisecond * 200,
 }
 
+const (
+	defaultAgentReadyTimeout = 30 * time.Second
+	agentReadyInitialBackoff = 50 * time.Millisecond
+	agentReadyMaxBackoff     = time.Second
+)
+
 func CloseAgent() error {
-	_, err := netClient.Get(fmt.Sprintf("http://%s:%d/shutdown", ios.HttpApiHost(), ios.HttpApiPort()))
+	statusCode, err := doAgentRequest(context.Background(), netClient, http.MethodGet, agentAPIURL("/shutdown"))
 	if err != nil {
 		return fmt.Errorf("CloseAgent: failed to send shutdown request: %w", err)
+	}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("CloseAgent: server returned HTTP status %d", statusCode)
 	}
 	return nil
 }
 
 func IsAgentRunning() bool {
-	resp, err := netClient.Get(fmt.Sprintf("http://%s:%d/health", ios.HttpApiHost(), ios.HttpApiPort()))
-	if err != nil {
-		return false
-	}
-	return resp.StatusCode == http.StatusOK
+	running, _ := IsAgentRunningContext(context.Background())
+	return running
 }
+
+func IsAgentRunningContext(ctx context.Context) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	statusCode, err := doAgentRequest(ctx, netClient, http.MethodGet, agentAPIURL("/health"))
+	if err != nil {
+		return false, fmt.Errorf("IsAgentRunning: health request failed: %w", err)
+	}
+	return statusCode == http.StatusOK, nil
+}
+
+// WaitUntilAgentReady preserves the historical boolean API. New callers that
+// need diagnostics or a shorter deadline should use WaitUntilAgentReadyContext.
 func WaitUntilAgentReady() bool {
+	return WaitUntilAgentReadyContext(context.Background()) == nil
+}
+
+// WaitUntilAgentReadyContext polls the readiness endpoint with bounded
+// exponential backoff. Even a context without a deadline is capped so a dead
+// agent cannot leave startup blocked forever.
+func WaitUntilAgentReadyContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, defaultAgentReadyTimeout)
+	defer cancel()
+	return waitUntilAgentReady(waitCtx, netClient, agentAPIURL("/ready"), agentReadyInitialBackoff, agentReadyMaxBackoff)
+}
+
+func waitUntilAgentReady(ctx context.Context, client *http.Client, readyURL string, initialBackoff, maxBackoff time.Duration) error {
+	if initialBackoff <= 0 {
+		initialBackoff = time.Millisecond
+	}
+	if maxBackoff < initialBackoff {
+		maxBackoff = initialBackoff
+	}
+
+	backoff := initialBackoff
+	var lastErr error
 	for {
-		slog.Info("Waiting for go-ios agent to be ready...")
-		resp, err := netClient.Get(fmt.Sprintf("http://%s:%d/ready", ios.HttpApiHost(), ios.HttpApiPort()))
-		if err != nil {
-			return false
+		if err := ctx.Err(); err != nil {
+			return agentReadyWaitError(err, lastErr)
 		}
-		if resp.StatusCode == http.StatusOK {
+		slog.Info("Waiting for go-ios agent to be ready...")
+		statusCode, err := doAgentRequest(ctx, client, http.MethodGet, readyURL)
+		if err == nil && statusCode == http.StatusOK {
 			slog.Info("Go-iOS Agent is ready")
-			return true
+			return nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("server returned HTTP status %d", statusCode)
+		}
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return agentReadyWaitError(ctx.Err(), lastErr)
+		case <-timer.C:
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 		}
 	}
+}
+
+func agentReadyWaitError(contextErr, lastErr error) error {
+	if lastErr == nil {
+		return fmt.Errorf("WaitUntilAgentReady: %w", contextErr)
+	}
+	return fmt.Errorf("WaitUntilAgentReady: %w", errors.Join(contextErr, lastErr))
+}
+
+func agentAPIURL(path string) string {
+	return tunnelInfoURL(ios.HttpApiHost(), ios.HttpApiPort(), path)
+}
+
+func doAgentRequest(ctx context.Context, client *http.Client, method, requestURL string) (int, error) {
+	request, err := http.NewRequestWithContext(ctx, method, requestURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		if response != nil {
+			_ = drainAndCloseResponse(response)
+		}
+		return 0, err
+	}
+	statusCode := response.StatusCode
+	if err := drainAndCloseResponse(response); err != nil {
+		return statusCode, err
+	}
+	return statusCode, nil
+}
+
+func drainAndCloseResponse(response *http.Response) error {
+	if response == nil || response.Body == nil {
+		return nil
+	}
+	_, drainErr := io.Copy(io.Discard, response.Body)
+	closeErr := response.Body.Close()
+	return errors.Join(drainErr, closeErr)
+}
+
+const agentAutoStartEnvironment = "ENABLE_GO_IOS_AGENT"
+
+type agentChildProcess interface {
+	Release() error
+	Kill() error
+	Wait() error
+	Done() <-chan struct{}
+}
+
+type execAgentChildProcess struct {
+	command  *exec.Cmd
+	waitOnce sync.Once
+	waitDone chan struct{}
+	waitErr  error
+}
+
+func (p *execAgentChildProcess) Release() error {
+	// The asynchronous waiter started by newExecAgentChildProcess owns process
+	// cleanup. Process.Release is deliberately not used: on Unix it does not reap
+	// a child that already exited after losing a concurrent listener race.
+	return nil
+}
+
+func (p *execAgentChildProcess) Kill() error {
+	return p.command.Process.Kill()
+}
+
+func (p *execAgentChildProcess) Wait() error {
+	p.waitOnce.Do(func() {
+		p.waitErr = p.command.Wait()
+		close(p.waitDone)
+	})
+	<-p.waitDone
+	return p.waitErr
+}
+
+func (p *execAgentChildProcess) Done() <-chan struct{} {
+	return p.waitDone
+}
+
+func newExecAgentChildProcess(command *exec.Cmd) *execAgentChildProcess {
+	child := &execAgentChildProcess{command: command, waitDone: make(chan struct{})}
+	// Begin waiting immediately so an early-exiting loser is always reaped, even
+	// if /ready is served by another concurrently started process.
+	go child.Wait()
+	return child
+}
+
+type runAgentOperations struct {
+	isRunning  func(context.Context) (bool, error)
+	waitReady  func(context.Context) error
+	executable func() (string, error)
+	start      func(string, []string) (agentChildProcess, error)
+}
+
+func defaultRunAgentOperations() runAgentOperations {
+	return runAgentOperations{
+		isRunning:  IsAgentRunningContext,
+		waitReady:  WaitUntilAgentReadyContext,
+		executable: os.Executable,
+		start: func(executable string, arguments []string) (agentChildProcess, error) {
+			command := newAgentCommand(executable, arguments)
+			if err := command.Start(); err != nil {
+				return nil, err
+			}
+			return newExecAgentChildProcess(command), nil
+		},
+	}
+}
+
+func newAgentCommand(executable string, arguments []string) *exec.Cmd {
+	command := exec.Command(executable, arguments...)
+	command.SysProcAttr = createSysProcAttr()
+	// The child is the agent. Letting it inherit the auto-start switch makes it
+	// enter RunAgent again before its own command dispatch and recursively spawn
+	// more children while /health is still unavailable.
+	command.Env = environmentWithoutKey(os.Environ(), agentAutoStartEnvironment)
+	return command
+}
+
+func environmentWithoutKey(environment []string, key string) []string {
+	filtered := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		entryKey, _, found := strings.Cut(entry, "=")
+		if found && strings.EqualFold(entryKey, key) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
 }
 
 func RunAgent(mode string, args ...string) error {
-	if IsAgentRunning() {
-		return nil
-	}
-	slog.Info("Go-iOS Agent not running, starting it on port", "port", ios.HttpApiPort())
-	ex, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("RunAgent: failed to get executable path: %w", err)
+	return runAgent(context.Background(), mode, args, defaultRunAgentOperations())
+}
+
+func runAgent(ctx context.Context, mode string, args []string, operations runAgentOperations) error {
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
-	var cmd *exec.Cmd
+	running, healthErr := operations.isRunning(ctx)
+	if healthErr == nil && running {
+		// /health is liveness only. An existing agent can still be rebuilding its
+		// first device snapshot, so callers must not proceed until /ready succeeds.
+		if err := operations.waitReady(ctx); err != nil {
+			return fmt.Errorf("RunAgent: existing agent did not become ready: %w", err)
+		}
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("RunAgent: check agent health: %w", errors.Join(err, healthErr))
+	}
+
+	var commandArguments []string
 	switch mode {
 	case "kernel":
-		cmd = exec.Command(ex, append([]string{"tunnel", "start"}, args...)...)
+		commandArguments = append([]string{"tunnel", "start"}, args...)
 	case "user":
-		cmd = exec.Command(ex, append([]string{"tunnel", "start", "--userspace"}, args...)...)
+		commandArguments = append([]string{"tunnel", "start", "--userspace"}, args...)
 	default:
 		return fmt.Errorf("RunAgent: unknown mode: %s. Only 'kernel' and 'user' are supported", mode)
 	}
 
-	// OS specific SysProcAttr assignment
-	cmd.SysProcAttr = createSysProcAttr()
-
-	err = cmd.Start()
-
+	slog.Info("Go-iOS Agent not running, starting it on port", "port", ios.HttpApiPort(), "healthError", healthErr)
+	executable, err := operations.executable()
+	if err != nil {
+		return fmt.Errorf("RunAgent: failed to get executable path: %w", err)
+	}
+	child, err := operations.start(executable, commandArguments)
 	if err != nil {
 		return fmt.Errorf("RunAgent: failed to start agent: %w", err)
 	}
-	err = cmd.Process.Release()
-	if err != nil {
-		return fmt.Errorf("RunAgent: failed to release process: %w", err)
+
+	readyResult := make(chan error, 1)
+	go func() {
+		readyResult <- operations.waitReady(ctx)
+	}()
+
+	select {
+	case readyErr := <-readyResult:
+		if readyErr == nil {
+			// Release only after readiness. The production implementation transfers
+			// ownership to its already-running asynchronous reaper.
+			if err := child.Release(); err != nil {
+				cleanupErr := terminateAgentChild(child)
+				return fmt.Errorf("RunAgent: failed to release process: %w", errors.Join(err, cleanupErr))
+			}
+			return nil
+		}
+		// Only terminate the process handle we started. In particular, do not call
+		// /shutdown here: another concurrently starting agent may have won the
+		// listener race and must be left untouched.
+		cleanupErr := terminateAgentChild(child)
+		return fmt.Errorf("RunAgent: agent did not become ready: %w", errors.Join(readyErr, cleanupErr))
+	case <-child.Done():
+		// Reap first, then let the global readiness observation decide the result.
+		// A concurrently spawned winner may legitimately be serving /ready even
+		// though this caller's child lost the port race and exited.
+		childExitErr := child.Wait()
+		readyErr := <-readyResult
+		if readyErr == nil {
+			return nil
+		}
+		if childExitErr == nil {
+			childExitErr = errors.New("agent child exited before readiness")
+		} else {
+			childExitErr = fmt.Errorf("agent child exited before readiness: %w", childExitErr)
+		}
+		return fmt.Errorf("RunAgent: agent did not become ready: %w", errors.Join(readyErr, childExitErr))
 	}
-	WaitUntilAgentReady()
-	return nil
+}
+
+func terminateAgentChild(child agentChildProcess) error {
+	killErr := child.Kill()
+	waitErr := child.Wait()
+
+	if errors.Is(killErr, os.ErrProcessDone) {
+		killErr = nil
+	}
+	// A killed child normally reports its signal or non-zero exit through Wait;
+	// that is successful reaping, not a cleanup failure.
+	var exitErr *exec.ExitError
+	if errors.As(waitErr, &exitErr) {
+		waitErr = nil
+	}
+	if killErr != nil {
+		killErr = fmt.Errorf("kill failed agent child: %w", killErr)
+	}
+	if waitErr != nil {
+		waitErr = fmt.Errorf("wait for failed agent child: %w", waitErr)
+	}
+	return errors.Join(killErr, waitErr)
 }
 
 // ServeTunnelInfo starts a simple http serve that exposes the tunnel information about the running tunnel.
-// The API has two endpoints:
+// The API has three endpoints:
 // 1. GET    localhost:{PORT}/tunnel/{UDID} to get the tunnel info for a specific device
 // 2. DELETE localhost:{PORT}/tunnel/{UDID} to stop a device tunnel
 // 3. GET    localhost:{PORT}/tunnels       to get a list of all tunnels
 func ServeTunnelInfo(tm *TunnelManager, port int) error {
+	if err := http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", port), tunnelInfoHTTPHandler(tm)); err != nil {
+		return fmt.Errorf("ServeTunnelInfo: failed to start http server: %w", err)
+	}
+	return nil
+}
+
+func tunnelInfoHTTPHandler(tm *TunnelManager) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(writer http.ResponseWriter, request *http.Request) {
 		writer.WriteHeader(http.StatusOK)
@@ -122,6 +399,12 @@ func ServeTunnelInfo(tm *TunnelManager, port int) error {
 	mux.HandleFunc("/tunnel/", func(writer http.ResponseWriter, request *http.Request) {
 		udid := strings.TrimPrefix(request.URL.Path, "/tunnel/")
 		if len(udid) == 0 {
+			http.NotFound(writer, request)
+			return
+		}
+		if request.Method != http.MethodGet && request.Method != http.MethodDelete {
+			writer.Header().Set("Allow", "GET, DELETE")
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
@@ -135,12 +418,15 @@ func ServeTunnelInfo(tm *TunnelManager, port int) error {
 			return
 		}
 
-		if request.Method == "GET" {
-			writer.Header().Add("Content-Type", "application/json")
+		if request.Method == http.MethodGet {
+			writer.Header().Set("Content-Type", "application/json")
 			enc := json.NewEncoder(writer)
 			err = enc.Encode(t)
-		} else if request.Method == "DELETE" {
-			err = tm.stopTunnel(t)
+		} else {
+			err = tm.removeTunnel(t)
+			if err == nil {
+				writer.WriteHeader(http.StatusNoContent)
+			}
 		}
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusInternalServerError)
@@ -148,13 +434,18 @@ func ServeTunnelInfo(tm *TunnelManager, port int) error {
 		}
 	})
 	mux.HandleFunc("/tunnels", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			writer.Header().Set("Allow", "GET")
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		tunnels, err := tm.ListTunnels()
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		writer.Header().Add("Content-Type", "application/json")
+		writer.Header().Set("Content-Type", "application/json")
 		enc := json.NewEncoder(writer)
 		err = enc.Encode(tunnels)
 		if err != nil {
@@ -162,25 +453,46 @@ func ServeTunnelInfo(tm *TunnelManager, port int) error {
 			return
 		}
 	})
-	if err := http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", port), mux); err != nil {
-		return fmt.Errorf("ServeTunnelInfo: failed to start http server: %w", err)
+	return mux
+}
+
+func tunnelInfoURL(host string, port int, path string) string {
+	// API callers sometimes pass an IPv6 literal in URL form ("[::1]").
+	// JoinHostPort adds the brackets itself, so strip exactly one matching pair.
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
 	}
-	return nil
+	return fmt.Sprintf("http://%s%s", net.JoinHostPort(host, strconv.Itoa(port)), path)
+}
+
+func readTunnelInfoResponse(operation string, response *http.Response) ([]byte, error) {
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, fmt.Errorf("%s: failed to read body: %w", operation, err)
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		detail := strings.TrimSpace(string(body))
+		if detail != "" {
+			return nil, fmt.Errorf("%s: server returned %s: %s", operation, response.Status, detail)
+		}
+		return nil, fmt.Errorf("%s: server returned %s", operation, response.Status)
+	}
+	return body, nil
 }
 
 func TunnelInfoForDevice(udid string, tunnelInfoHost string, tunnelInfoPort int) (Tunnel, error) {
 	c := http.Client{
 		Timeout: 5 * time.Second,
 	}
-	res, err := c.Get(fmt.Sprintf("http://%s:%d/tunnel/%s", tunnelInfoHost, tunnelInfoPort, udid))
+	res, err := c.Get(tunnelInfoURL(tunnelInfoHost, tunnelInfoPort, "/tunnel/"+url.PathEscape(udid)))
 	if err != nil {
 		return Tunnel{}, fmt.Errorf("TunnelInfoForDevice: failed to get tunnel info: %w", err)
 	}
 	defer res.Body.Close()
 
-	body, err := io.ReadAll(res.Body)
+	body, err := readTunnelInfoResponse("TunnelInfoForDevice", res)
 	if err != nil {
-		return Tunnel{}, fmt.Errorf("TunnelInfoForDevice: failed to read body: %w", err)
+		return Tunnel{}, err
 	}
 	var info Tunnel
 	err = json.Unmarshal(body, &info)
@@ -194,20 +506,20 @@ func ListRunningTunnels(tunnelInfoHost string, tunnelInfoPort int) ([]Tunnel, er
 	c := http.Client{
 		Timeout: 5 * time.Second,
 	}
-	res, err := c.Get(fmt.Sprintf("http://%s:%d/tunnels", tunnelInfoHost, tunnelInfoPort))
+	res, err := c.Get(tunnelInfoURL(tunnelInfoHost, tunnelInfoPort, "/tunnels"))
 	if err != nil {
-		return nil, fmt.Errorf("TunnelInfoForDevice: failed to get tunnel info: %w", err)
+		return nil, fmt.Errorf("ListRunningTunnels: failed to get tunnel info: %w", err)
 	}
 	defer res.Body.Close()
 
-	body, err := io.ReadAll(res.Body)
+	body, err := readTunnelInfoResponse("ListRunningTunnels", res)
 	if err != nil {
-		return nil, fmt.Errorf("TunnelInfoForDevice: failed to read body: %w", err)
+		return nil, err
 	}
 	var info []Tunnel
 	err = json.Unmarshal(body, &info)
 	if err != nil {
-		return nil, fmt.Errorf("TunnelInfoForDevice: failed to parse response: %w", err)
+		return nil, fmt.Errorf("ListRunningTunnels: failed to parse response: %w", err)
 	}
 	return info, nil
 }
@@ -229,6 +541,7 @@ type TunnelManager struct {
 	closeErr             error
 	closed               bool
 	portOffset           int
+	nextGeneration       uint64
 }
 
 // NewTunnelManager creates a new TunnelManager instance for setting up device tunnels for all connected devices
@@ -299,8 +612,27 @@ func (m *TunnelManager) UpdateTunnels(ctx context.Context) error {
 	var updateErr error
 	for _, d := range devices.DeviceList {
 		udid := d.Properties.SerialNumber
-		if _, exists := localTunnels[udid]; exists {
+		attachment := tunnelAttachmentFingerprintForDevice(d)
+		oldTunnel, replacing := localTunnels[udid]
+		if replacing && oldTunnel.attachment == attachment && oldTunnel.alive() {
 			continue
+		}
+		if replacing {
+			if !oldTunnel.alive() && oldTunnel.Err() != nil {
+				log.WithFields(log.Fields{
+					"udid": udid,
+					"err":  oldTunnel.Err(),
+				}).Warn("rebuilding stopped tunnel underlay")
+			}
+			// A different usbmux attachment with the same UDID is a new physical
+			// generation. A stopped underlay with the same attachment is likewise
+			// unusable. Remove and fully join either one before starting a replacement.
+			// On a start failure the slot intentionally remains absent (not ready) and
+			// the next update retries the current attachment.
+			if stopErr := m.stopTunnel(oldTunnel); stopErr != nil {
+				updateErr = errors.Join(updateErr, fmt.Errorf("stop replaced tunnel for %s: %w", udid, stopErr))
+			}
+			delete(localTunnels, udid)
 		}
 		if m.userspaceTUN && d.UserspaceTUNPort == 0 {
 			d.UserspaceTUNPort = m.nextUserspaceTUNPort()
@@ -316,10 +648,23 @@ func (m *TunnelManager) UpdateTunnels(ctx context.Context) error {
 		// The map key and serialized tunnel identity must always describe the
 		// device we just reconciled, even if a starter omitted the field.
 		t.Udid = udid
+		t.attachment = attachment
 		m.mux.Lock()
-		localTunnels[udid] = t
-		m.tunnels[udid] = t
+		_, currentExists := m.tunnels[udid]
+		canPublish := !m.closed && !currentExists
+		if canPublish {
+			m.nextGeneration++
+			t.generation = m.nextGeneration
+			localTunnels[udid] = t
+			m.tunnels[udid] = t
+		}
 		m.mux.Unlock()
+		if !canPublish {
+			if closeErr := t.Close(); closeErr != nil {
+				updateErr = errors.Join(updateErr, fmt.Errorf("close unpublished tunnel for %s: %w", udid, closeErr))
+			}
+			continue
+		}
 	}
 	for udid, tun := range localTunnels {
 		idx := slices.ContainsFunc(devices.DeviceList, func(entry ios.DeviceEntry) bool {
@@ -339,7 +684,17 @@ func (m *TunnelManager) UpdateTunnels(ctx context.Context) error {
 	return updateErr
 }
 
+func tunnelAttachmentFingerprintForDevice(device ios.DeviceEntry) tunnelAttachmentFingerprint {
+	return tunnelAttachmentFingerprint{
+		deviceID:   device.DeviceID,
+		locationID: device.Properties.LocationID,
+	}
+}
+
 func (m *TunnelManager) RemoveTunnel(ctx context.Context, serialNumber string) error {
+	m.updateMux.Lock()
+	defer m.updateMux.Unlock()
+
 	m.mux.RLock()
 	tun, ok := m.tunnels[serialNumber]
 	m.mux.RUnlock()
@@ -349,16 +704,24 @@ func (m *TunnelManager) RemoveTunnel(ctx context.Context, serialNumber string) e
 	return m.stopTunnel(tun)
 }
 
+// removeTunnel serializes an already-resolved generation with UpdateTunnels
+// and Close. Keeping the token avoids a delayed HTTP DELETE closing a newer
+// attachment that reused the same UDID.
+func (m *TunnelManager) removeTunnel(t Tunnel) error {
+	m.updateMux.Lock()
+	defer m.updateMux.Unlock()
+	return m.stopTunnel(t)
+}
+
 func (m *TunnelManager) stopTunnel(t Tunnel) error {
 	m.mux.Lock()
 	current, exists := m.tunnels[t.Udid]
-	if exists {
-		delete(m.tunnels, t.Udid)
-	}
-	m.mux.Unlock()
-	if !exists {
+	if !exists || current.generation != t.generation {
+		m.mux.Unlock()
 		return nil
 	}
+	delete(m.tunnels, t.Udid)
+	m.mux.Unlock()
 
 	log.WithField("udid", t.Udid).Info("stopping tunnel")
 	return current.Close()
@@ -420,14 +783,14 @@ type manualPairingTunnelStart struct {
 
 func (m manualPairingTunnelStart) StartTunnel(ctx context.Context, device ios.DeviceEntry, p PairRecordManager, version *semver.Version, userspaceTUN bool) (Tunnel, error) {
 
-	if version.GreaterThan(semver.MustParse("17.4.0")) {
+	if usesCoreDeviceTunnelProtocol(version) {
 		if userspaceTUN {
-			tun, err := ConnectUserSpaceTunnelLockdown(device, device.UserspaceTUNPort)
+			tun, err := ConnectUserSpaceTunnelLockdownContext(ctx, device, device.UserspaceTUNPort)
 			tun.UserspaceTUN = true
 			tun.UserspaceTUNPort = device.UserspaceTUNPort
 			return tun, err
 		}
-		return ConnectTunnelLockdown(device)
+		return ConnectTunnelLockdownContext(ctx, device)
 	}
 	if version.Major() >= 17 {
 		if userspaceTUN {
@@ -436,6 +799,10 @@ func (m manualPairingTunnelStart) StartTunnel(ctx context.Context, device ios.De
 		return ManualPairAndConnectToTunnel(ctx, device, p)
 	}
 	return Tunnel{}, fmt.Errorf("manualPairingTunnelStart: unsupported iOS version %s", version.String())
+}
+
+func usesCoreDeviceTunnelProtocol(version *semver.Version) bool {
+	return version != nil && !version.LessThan(semver.MustParse("17.4.0"))
 }
 
 type deviceList struct {

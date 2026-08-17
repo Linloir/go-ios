@@ -47,6 +47,14 @@ type UserSpaceTUNInterface struct {
 	//If EnableSniffer, raw TCP packets will be dumped to the console.
 	EnableSniffer bool
 	networkStack  *stack.Stack
+	endpoint      *Endpoint
+
+	lifecycleMu          sync.Mutex
+	closing              bool
+	clientCtx            context.Context
+	cancelClients        context.CancelFunc
+	beforeEndpointCreate func()
+	afterEndpointCreate  func()
 }
 
 func (iface *UserSpaceTUNInterface) TunnelRWCThroughInterface(localPort uint16, remoteAddr net.IP, remotePort uint16, rw io.ReadWriteCloser) error {
@@ -57,11 +65,31 @@ func (iface *UserSpaceTUNInterface) TunnelRWCThroughInterface(localPort uint16, 
 		Port: remotePort,
 	}
 
+	if iface.beforeEndpointCreate != nil {
+		iface.beforeEndpointCreate()
+	}
+	// Serialize endpoint creation and connect registration with Stack.Close.
+	// NewEndpoint alone doesn't register a TCP endpoint with the stack, so the
+	// gate remains held through EventRegister and the initial Connect call.
+	iface.lifecycleMu.Lock()
+	if iface.closing || iface.networkStack == nil {
+		iface.lifecycleMu.Unlock()
+		return errors.New("TunnelRWCThroughInterface: userspace tunnel is closing")
+	}
+	clientCtx := iface.clientCtx
+	if clientCtx == nil {
+		clientCtx = context.Background()
+	}
 	// Create TCP endpoint.
 	var wq waiter.Queue
 	ep, err := iface.networkStack.NewEndpoint(tcp.ProtocolNumber, ipv6.ProtocolNumber, &wq)
 	if err != nil {
+		iface.lifecycleMu.Unlock()
 		return fmt.Errorf("TunnelRWCThroughInterface: NewEndpoint failed: %+v", err)
+	}
+	defer ep.Close()
+	if iface.afterEndpointCreate != nil {
+		iface.afterEndpointCreate()
 	}
 
 	ep.SocketOptions().SetKeepAlive(true)
@@ -75,6 +103,7 @@ func (iface *UserSpaceTUNInterface) TunnelRWCThroughInterface(localPort uint16, 
 	// Bind if a port is specified.
 	if localPort != 0 {
 		if err := ep.Bind(tcpip.FullAddress{Port: localPort}); err != nil {
+			iface.lifecycleMu.Unlock()
 			return fmt.Errorf("TunnelRWCThroughInterface: Bind failed: %+v", err)
 		}
 	}
@@ -82,11 +111,20 @@ func (iface *UserSpaceTUNInterface) TunnelRWCThroughInterface(localPort uint16, 
 	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.WritableEvents)
 	wq.EventRegister(&waitEntry)
 	err = ep.Connect(remote)
+	iface.lifecycleMu.Unlock()
+	var connectContextErr error
 	if _, ok := err.(*tcpip.ErrConnectStarted); ok {
-		<-notifyCh
-		err = ep.LastError()
+		select {
+		case <-notifyCh:
+			err = ep.LastError()
+		case <-clientCtx.Done():
+			connectContextErr = fmt.Errorf("userspace tunnel closed while connecting: %w", clientCtx.Err())
+		}
 	}
 	wq.EventUnregister(&waitEntry)
+	if connectContextErr != nil {
+		return connectContextErr
+	}
 	if err != nil {
 		return fmt.Errorf("TunnelRWCThroughInterface: Connect to remote failed: %+v", err)
 	}
@@ -143,14 +181,17 @@ func (iface *UserSpaceTUNInterface) Init(mtu uint32, connToTUNIface io.ReadWrite
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
 	})
+	iface.clientCtx, iface.cancelClients = context.WithCancel(context.Background())
 
 	// connToTUNIface needs to be connection that understands IP packets,
 	// so we can use it to link it against a virtual network interface
 	var linkEP stack.LinkEndpoint
-	linkEP, err := RWCEndpointNew(connToTUNIface, mtu, 0)
+	endpoint, err := RWCEndpointNew(connToTUNIface, mtu, 0)
 	if err != nil {
 		return fmt.Errorf("initVirtualInterface: RWCEndpointNew failed: %+v", err)
 	}
+	iface.endpoint = endpoint
+	linkEP = endpoint
 
 	nicID := tcpip.NICID(iface.networkStack.UniqueID())
 	iface.nicID = nicID
@@ -179,19 +220,89 @@ func (iface *UserSpaceTUNInterface) Init(mtu uint32, connToTUNIface io.ReadWrite
 	return nil
 }
 
+func (iface *UserSpaceTUNInterface) closeStackAndWait() {
+	if iface == nil {
+		return
+	}
+	iface.lifecycleMu.Lock()
+	iface.closing = true
+	if iface.cancelClients != nil {
+		iface.cancelClients()
+	}
+	networkStack := iface.networkStack
+	if networkStack != nil {
+		networkStack.Close()
+	}
+	iface.lifecycleMu.Unlock()
+	if networkStack != nil {
+		networkStack.Wait()
+	}
+	iface.waitTransport()
+}
+
+func (iface *UserSpaceTUNInterface) transportDone() <-chan struct{} {
+	if iface == nil || iface.endpoint == nil {
+		return nil
+	}
+	return iface.endpoint.Done()
+}
+
+func (iface *UserSpaceTUNInterface) waitTransport() {
+	if iface != nil && iface.endpoint != nil {
+		iface.endpoint.Wait()
+	}
+}
+
 func ConnectUserSpaceTunnelLockdown(device ios.DeviceEntry, ifacePort int) (Tunnel, error) {
-	conn, err := ios.ConnectToService(device, coreDeviceProxy)
+	return ConnectUserSpaceTunnelLockdownContext(context.Background(), device, ifacePort)
+}
+
+func ConnectUserSpaceTunnelLockdownContext(ctx context.Context, device ios.DeviceEntry, ifacePort int) (Tunnel, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return Tunnel{}, err
+	}
+	conn, err := ios.ConnectToServiceContext(ctx, device, coreDeviceProxy)
 	if err != nil {
 		return Tunnel{}, err
 	}
-	return connectToUserspaceTunnelLockdown(context.TODO(), device, conn, ifacePort)
+	return connectToUserspaceTunnelLockdown(ctx, device, conn, ifacePort)
 }
 
 func connectToUserspaceTunnelLockdown(ctx context.Context, device ios.DeviceEntry, connToDevice io.ReadWriteCloser, ifacePort int) (Tunnel, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		_ = connToDevice.Close()
+		return Tunnel{}, err
+	}
+	setupCloseDone := make(chan struct{})
+	stopSetupClose := context.AfterFunc(ctx, func() {
+		defer close(setupCloseDone)
+		_ = connToDevice.Close()
+	})
+	stopSetupWatcher := func() bool {
+		stopped := stopSetupClose()
+		if !stopped {
+			<-setupCloseDone
+		}
+		return stopped
+	}
+	setupWatcherActive := true
+	defer func() {
+		if setupWatcherActive {
+			stopSetupWatcher()
+		}
+	}()
+
 	slog.Info("connect to lockdown tunnel endpoint on device")
 	tunnelInfo, err := exchangeCoreTunnelParameters(connToDevice)
 	if err != nil {
-		return Tunnel{}, fmt.Errorf("could not exchange tunnel parameters. %w", err)
+		_ = connToDevice.Close()
+		return Tunnel{}, coreTunnelSetupError(ctx, "could not exchange tunnel parameters", err)
 	}
 	const prefixLength = 64
 	// The lockdown tunnel carries raw IPv6 packets over a TCP byte stream.
@@ -200,48 +311,146 @@ func connectToUserspaceTunnelLockdown(ctx context.Context, device ios.DeviceEntr
 	iface := UserSpaceTUNInterface{}
 	err = iface.Init(uint32(tunnelInfo.ClientParameters.Mtu), framedConn, tunnelInfo.ClientParameters.Address, prefixLength)
 	if err != nil {
-		return Tunnel{}, fmt.Errorf("could not setup tunnel interface. %w", err)
+		_ = connToDevice.Close()
+		iface.closeStackAndWait()
+		return Tunnel{}, coreTunnelSetupError(ctx, "could not setup tunnel interface", err)
 	}
 
 	listener, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", ifacePort))
 	if err != nil {
-		return Tunnel{}, fmt.Errorf("could not setup listener. %w", err)
+		_ = connToDevice.Close()
+		iface.closeStackAndWait()
+		return Tunnel{}, coreTunnelSetupError(ctx, "could not setup listener", err)
 	}
 
-	listener.Addr()
-	go listenToConns(iface, listener)
-
-	closeFunc := func() error {
-		iface.networkStack.Close()
-		return errors.Join(connToDevice.Close(), listener.Close())
+	server := newUserspaceTunnelServer(&iface, listener)
+	closeResources := func() error {
+		listenerErr := server.close()
+		connErr := connToDevice.Close()
+		iface.closeStackAndWait()
+		server.wait()
+		return errors.Join(listenerErr, connErr)
+	}
+	runtime := startUserspaceLockdownTunnelRuntime(ctx, server.serve, iface.transportDone(), closeResources)
+	if !stopSetupWatcher() {
+		setupWatcherActive = false
+		_ = runtime.closeAndWait()
+		return Tunnel{}, coreTunnelSetupError(ctx, "userspace tunnel setup canceled", nil)
+	}
+	setupWatcherActive = false
+	if err := ctx.Err(); err != nil {
+		_ = runtime.closeAndWait()
+		return Tunnel{}, err
 	}
 	return Tunnel{
 		Address: tunnelInfo.ServerAddress,
 		RsdPort: int(tunnelInfo.ServerRSDPort),
 		Udid:    device.Properties.SerialNumber,
-		closer:  closeFunc,
+		runtime: runtime,
 	}, nil
 }
 
-func listenToConns(iface UserSpaceTUNInterface, listener net.Listener) error {
-	defer func() {
-		slog.Info("Stopped listening for connections")
-	}()
+func startUserspaceLockdownTunnelRuntime(ctx context.Context, serve func() error, transportDone <-chan struct{}, closeResources func() error) *tunnelRuntime {
+	return newTunnelRuntime(ctx, closeResources,
+		tunnelRuntimeWorker{name: "userspace listener", run: func(context.Context) error {
+			return serve()
+		}},
+		tunnelRuntimeWorker{name: "userspace transport", run: func(workerCtx context.Context) error {
+			select {
+			case <-transportDone:
+				return errors.New("link endpoint stopped")
+			case <-workerCtx.Done():
+				return nil
+			}
+		}},
+	)
+}
 
-	for {
-		client, err := listener.Accept()
-		if err != nil {
-			return err
-		}
-		// Handle each client in its own goroutine so a single client's
-		// preamble error doesn't tear down the entire listen loop and
-		// leave the userspace TUN port unable to accept future
-		// connections.
-		go handleUserspaceClient(iface, client)
+type userspaceTunnelServer struct {
+	iface    *UserSpaceTUNInterface
+	listener net.Listener
+
+	mu       sync.Mutex
+	closing  bool
+	clients  map[net.Conn]struct{}
+	clientsW sync.WaitGroup
+	closeOne sync.Once
+	closeErr error
+}
+
+func newUserspaceTunnelServer(iface *UserSpaceTUNInterface, listener net.Listener) *userspaceTunnelServer {
+	return &userspaceTunnelServer{
+		iface:    iface,
+		listener: listener,
+		clients:  make(map[net.Conn]struct{}),
 	}
 }
 
-func handleUserspaceClient(iface UserSpaceTUNInterface, client net.Conn) {
+func (s *userspaceTunnelServer) serve() error {
+	defer slog.Info("Stopped listening for connections")
+	for {
+		client, err := s.listener.Accept()
+		if err != nil {
+			return err
+		}
+
+		s.mu.Lock()
+		if s.closing {
+			s.mu.Unlock()
+			_ = client.Close()
+			continue
+		}
+		s.clients[client] = struct{}{}
+		s.clientsW.Add(1)
+		s.mu.Unlock()
+
+		go func() {
+			defer s.clientsW.Done()
+			defer func() {
+				s.mu.Lock()
+				delete(s.clients, client)
+				s.mu.Unlock()
+			}()
+			handleUserspaceClient(s.iface, client)
+		}()
+	}
+}
+
+func (s *userspaceTunnelServer) close() error {
+	s.closeOne.Do(func() {
+		s.mu.Lock()
+		s.closing = true
+		clients := make([]net.Conn, 0, len(s.clients))
+		for client := range s.clients {
+			clients = append(clients, client)
+		}
+		s.mu.Unlock()
+
+		listenerErr := s.listener.Close()
+		if errors.Is(listenerErr, net.ErrClosed) {
+			listenerErr = nil
+		}
+		var clientsErr error
+		for _, client := range clients {
+			clientsErr = errors.Join(clientsErr, client.Close())
+		}
+		s.closeErr = errors.Join(listenerErr, clientsErr)
+	})
+	return s.closeErr
+}
+
+func (s *userspaceTunnelServer) wait() {
+	s.clientsW.Wait()
+}
+
+func listenToConns(iface *UserSpaceTUNInterface, listener net.Listener) error {
+	server := newUserspaceTunnelServer(iface, listener)
+	defer server.wait()
+	defer server.close()
+	return server.serve()
+}
+
+func handleUserspaceClient(iface *UserSpaceTUNInterface, client net.Conn) {
 	slog.Info("Received connection request", "from", client.RemoteAddr(), "to", client.LocalAddr())
 	// Defensive deadline so a stalled / partial-handshake client cannot
 	// pin a goroutine forever before sending the 20-byte preamble.

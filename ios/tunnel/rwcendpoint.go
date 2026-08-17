@@ -44,6 +44,11 @@ type Endpoint struct {
 
 	// wg keeps track of running goroutines.
 	wg sync.WaitGroup
+
+	// done closes as soon as either transport loop exits. Wait still joins both
+	// loops after the tunnel owner closes the underlying connection.
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 // RWCEndpointNew creates a new io.ReadWriter based endpoint. It is used to
@@ -70,6 +75,7 @@ func RWCEndpointNew(rw io.ReadWriter, mtu uint32, offset int) (*Endpoint, error)
 		rw:       rw,
 		mtu:      mtu,
 		offset:   offset,
+		done:     make(chan struct{}),
 	}, nil
 }
 
@@ -81,14 +87,25 @@ func (e *Endpoint) Attach(dispatcher stack.NetworkDispatcher) {
 		ctx, cancel := context.WithCancel(context.Background())
 		e.wg.Add(2)
 		go func() {
+			defer e.signalDone()
 			e.outboundLoop(ctx)
 			e.wg.Done()
 		}()
 		go func() {
+			defer e.signalDone()
 			e.dispatchLoop(cancel)
 			e.wg.Done()
 		}()
 	})
+}
+
+func (e *Endpoint) signalDone() {
+	e.doneOnce.Do(func() { close(e.done) })
+}
+
+// Done closes when either side of the userspace link transport terminates.
+func (e *Endpoint) Done() <-chan struct{} {
+	return e.done
 }
 
 func (e *Endpoint) Wait() {
@@ -102,7 +119,6 @@ func (e *Endpoint) dispatchLoop(cancel context.CancelFunc) {
 	defer cancel()
 
 	offset, mtu := e.offset, int(e.mtu)
-
 	for {
 		data := make([]byte, offset+mtu)
 
@@ -141,7 +157,9 @@ func (e *Endpoint) outboundLoop(ctx context.Context) {
 		if pkt == nil {
 			break
 		}
-		e.writePacket(pkt)
+		if err := e.writePacket(pkt); err != nil {
+			break
+		}
 	}
 }
 

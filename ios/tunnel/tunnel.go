@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -36,11 +37,56 @@ type Tunnel struct {
 	UserspaceTUN     bool `json:"userspaceTun"`
 	UserspaceTUNPort int  `json:"userspaceTunPort"`
 	closer           func() error
+	// runtime is deliberately not serialized. It carries the shared liveness,
+	// error, and join state for every copy of this tunnel value.
+	runtime *tunnelRuntime
+	// generation is assigned by TunnelManager whenever a tunnel is published.
+	// It is deliberately not serialized: it only prevents a delayed stop for an
+	// old attachment from removing or closing its replacement.
+	generation uint64
+	// attachment identifies the usbmux attachment that produced this tunnel.
+	// A device can detach and reattach with the same UDID between two polls; its
+	// usbmux DeviceID (and often LocationID) changes even though the key does not.
+	attachment tunnelAttachmentFingerprint
+}
+
+type tunnelAttachmentFingerprint struct {
+	deviceID   int
+	locationID int
 }
 
 // Close closes the connection to the device and removes the virtual network interface from the host
 func (t Tunnel) Close() error {
+	if t.runtime != nil {
+		return t.runtime.closeAndWait()
+	}
+	if t.closer == nil {
+		return nil
+	}
 	return t.closer()
+}
+
+// Done is closed after a production tunnel has stopped and all of its critical
+// workers have joined. Tunnels decoded from the HTTP API have no local runtime
+// and therefore return nil.
+func (t Tunnel) Done() <-chan struct{} {
+	if t.runtime == nil {
+		return nil
+	}
+	return t.runtime.done
+}
+
+// Err reports why a production tunnel stopped. It remains nil for an explicit
+// clean Close unless resource cleanup itself failed.
+func (t Tunnel) Err() error {
+	if t.runtime == nil {
+		return nil
+	}
+	return t.runtime.err()
+}
+
+func (t Tunnel) alive() bool {
+	return t.runtime == nil || t.runtime.alive()
 }
 
 // ManualPairAndConnectToTunnel tries to verify an existing pairing, and if this fails it triggers a new manual pairing process.
@@ -122,56 +168,70 @@ func connectToTunnel(ctx context.Context, info tunnelListener, addr string, devi
 
 	err = conn.SendDatagram(make([]byte, 1024))
 	if err != nil {
+		_ = conn.CloseWithError(0, "tunnel bootstrap datagram failed")
 		return Tunnel{}, err
 	}
 
 	stream, err := conn.OpenStream()
 	if err != nil {
+		_ = conn.CloseWithError(0, "tunnel handshake stream failed")
 		return Tunnel{}, err
 	}
 
 	tunnelInfo, err := exchangeCoreTunnelParameters(stream)
-	stream.Close()
+	_ = stream.Close()
 	if err != nil {
+		_ = conn.CloseWithError(0, "tunnel parameter exchange failed")
 		return Tunnel{}, fmt.Errorf("could not exchange tunnel parameters. %w", err)
 	}
 
 	utunIface, err := setupTunnelInterface(tunnelInfo)
 	if err != nil {
+		_ = conn.CloseWithError(0, "tunnel interface setup failed")
 		return Tunnel{}, fmt.Errorf("could not setup tunnel interface. %w", err)
 	}
 
-	// we want a copy of the parent ctx here, but it shouldn't time out/be cancelled at the same time.
-	// doing it like this allows us to have a context with a timeout for the tunnel creation, but the tunnel itself
-	tunnelCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-
-	go func() {
-		err := forwardDataToInterface(tunnelCtx, conn, utunIface)
-		if err != nil {
-			logrus.WithError(err).Error("failed to forward data to tunnel interface")
-		}
-	}()
-
-	go func() {
-		err := forwardDataToDevice(tunnelCtx, tunnelInfo.ClientParameters.Mtu, utunIface, conn)
-		if err != nil {
-			logrus.WithError(err).Error("failed to forward data to the device")
-		}
-	}()
-
-	closeFunc := func() error {
-		cancel()
-		quicErr := conn.CloseWithError(0, "")
-		utunErr := utunIface.Close()
-		return errors.Join(quicErr, utunErr)
-	}
+	runtime := startQUICKernelTunnelRuntime(ctx, conn, utunIface, tunnelInfo.ClientParameters.Mtu)
 
 	return Tunnel{
 		Address: tunnelInfo.ServerAddress,
 		RsdPort: int(tunnelInfo.ServerRSDPort),
 		Udid:    device.Properties.SerialNumber,
-		closer:  closeFunc,
+		runtime: runtime,
 	}, nil
+}
+
+type tunnelDatagramConnection interface {
+	SendDatagram([]byte) error
+	ReceiveDatagram(context.Context) ([]byte, error)
+	CloseWithError(quic.ApplicationErrorCode, string) error
+	Context() context.Context
+}
+
+func startQUICKernelTunnelRuntime(ctx context.Context, conn tunnelDatagramConnection, utunIface io.ReadWriteCloser, mtu uint64) *tunnelRuntime {
+	closeResources := func() error {
+		// Closing both directions is required: ReceiveDatagram is released by the
+		// QUIC close while a blocking TUN Read is released by closing the interface.
+		return errors.Join(
+			conn.CloseWithError(0, ""),
+			utunIface.Close(),
+		)
+	}
+	return newTunnelRuntime(ctx, closeResources,
+		tunnelRuntimeWorker{name: "QUIC receive forwarding", run: func(workerCtx context.Context) error {
+			return forwardDataToInterface(workerCtx, conn, utunIface)
+		}},
+		tunnelRuntimeWorker{name: "QUIC send forwarding", run: func(workerCtx context.Context) error {
+			return forwardDataToDevice(workerCtx, mtu, utunIface, conn)
+		}},
+		tunnelRuntimeWorker{name: "QUIC transport", run: func(context.Context) error {
+			<-conn.Context().Done()
+			if err := context.Cause(conn.Context()); err != nil {
+				return err
+			}
+			return conn.Context().Err()
+		}},
+	)
 }
 
 func runCmd(cmd *exec.Cmd) error {
@@ -221,7 +281,7 @@ func createTlsConfig(info tunnelListener) (*tls.Config, error) {
 	return conf, nil
 }
 
-func forwardDataToDevice(ctx context.Context, mtu uint64, r io.Reader, conn quic.Connection) error {
+func forwardDataToDevice(ctx context.Context, mtu uint64, r io.Reader, conn tunnelDatagramConnection) error {
 	packet := make([]byte, mtu)
 	for {
 		select {
@@ -240,7 +300,7 @@ func forwardDataToDevice(ctx context.Context, mtu uint64, r io.Reader, conn quic
 	}
 }
 
-func forwardDataToInterface(ctx context.Context, conn quic.Connection, w io.Writer) error {
+func forwardDataToInterface(ctx context.Context, conn tunnelDatagramConnection, w io.Writer) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -267,35 +327,55 @@ func exchangeCoreTunnelParameters(stream io.ReadWriteCloser) (tunnelParameters, 
 		return tunnelParameters{}, err
 	}
 
-	buf := bytes.NewBuffer(nil)
-	// Write on bytes.Buffer never returns an error
-	_, _ = buf.Write([]byte("CDTunnel\000"))
-	_ = buf.WriteByte(byte(len(rq)))
-	_, _ = buf.Write(rq)
-
-	_, err = stream.Write(buf.Bytes())
-	if err != nil {
-		return tunnelParameters{}, err
+	// The wire prefix is the eight-byte ASCII magic followed immediately by a
+	// uint16 big-endian length. For bodies below 256 bytes the high length byte
+	// is zero, which makes captures appear as "CDTunnel\0".
+	const magic = "CDTunnel"
+	if len(rq) > int(^uint16(0)) {
+		return tunnelParameters{}, fmt.Errorf("CoreDevice tunnel request is too large: %d", len(rq))
+	}
+	request := make([]byte, len(magic)+2+len(rq))
+	copy(request, magic)
+	binary.BigEndian.PutUint16(request[len(magic):], uint16(len(rq)))
+	copy(request[len(magic)+2:], rq)
+	if err := writeCoreTunnelFrame(stream, request); err != nil {
+		return tunnelParameters{}, fmt.Errorf("could not write CoreDevice tunnel request: %w", err)
 	}
 
-	header := make([]byte, len("CDTunnel")+2)
-	n, err := stream.Read(header)
-	if err != nil {
-		return tunnelParameters{}, fmt.Errorf("could not header read from stream. %w", err)
+	header := make([]byte, len(magic)+2)
+	if _, err := io.ReadFull(stream, header); err != nil {
+		return tunnelParameters{}, fmt.Errorf("could not read CoreDevice tunnel response header: %w", err)
 	}
-
-	bodyLen := header[len(header)-1]
-
-	res := make([]byte, bodyLen)
-	n, err = stream.Read(res)
-	if err != nil {
-		return tunnelParameters{}, fmt.Errorf("could not read from stream. %w", err)
+	if !bytes.Equal(header[:len(magic)], []byte(magic)) {
+		return tunnelParameters{}, fmt.Errorf("invalid CoreDevice tunnel response magic %q", header[:len(magic)])
+	}
+	bodyLen := int(binary.BigEndian.Uint16(header[len(magic):]))
+	body := make([]byte, bodyLen)
+	if _, err := io.ReadFull(stream, body); err != nil {
+		return tunnelParameters{}, fmt.Errorf("could not read CoreDevice tunnel response body (%d bytes): %w", bodyLen, err)
 	}
 
 	var parameters tunnelParameters
-	err = json.Unmarshal(res[:n], &parameters)
-	if err != nil {
-		return tunnelParameters{}, err
+	if err := json.Unmarshal(body, &parameters); err != nil {
+		return tunnelParameters{}, fmt.Errorf("could not decode CoreDevice tunnel response: %w", err)
 	}
 	return parameters, nil
+}
+
+func writeCoreTunnelFrame(writer io.Writer, frame []byte) error {
+	written := 0
+	for written < len(frame) {
+		n, err := writer.Write(frame[written:])
+		if n < 0 || n > len(frame)-written {
+			return fmt.Errorf("invalid write count %d", n)
+		}
+		written += n
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrNoProgress
+		}
+	}
+	return nil
 }

@@ -15,54 +15,105 @@ import (
 const coreDeviceProxy = "com.apple.internal.devicecompute.CoreDeviceProxy"
 
 func ConnectTunnelLockdown(device ios.DeviceEntry) (Tunnel, error) {
-	conn, err := ios.ConnectToService(device, coreDeviceProxy)
+	return ConnectTunnelLockdownContext(context.Background(), device)
+}
+
+func ConnectTunnelLockdownContext(ctx context.Context, device ios.DeviceEntry) (Tunnel, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return Tunnel{}, err
+	}
+	conn, err := ios.ConnectToServiceContext(ctx, device, coreDeviceProxy)
 	if err != nil {
 		return Tunnel{}, err
 	}
-	return connectToTunnelLockdown(context.TODO(), device, conn)
+	return connectToTunnelLockdown(ctx, device, conn)
 }
 
 func connectToTunnelLockdown(ctx context.Context, device ios.DeviceEntry, connToDevice io.ReadWriteCloser) (Tunnel, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		_ = connToDevice.Close()
+		return Tunnel{}, err
+	}
+	setupCloseDone := make(chan struct{})
+	stopSetupClose := context.AfterFunc(ctx, func() {
+		defer close(setupCloseDone)
+		_ = connToDevice.Close()
+	})
+	stopSetupWatcher := func() bool {
+		stopped := stopSetupClose()
+		if !stopped {
+			<-setupCloseDone
+		}
+		return stopped
+	}
+	setupWatcherActive := true
+	defer func() {
+		if setupWatcherActive {
+			stopSetupWatcher()
+		}
+	}()
+
 	logrus.Info("connect to lockdown tunnel endpoint on device")
 
 	tunnelInfo, err := exchangeCoreTunnelParameters(connToDevice)
 	if err != nil {
-		return Tunnel{}, fmt.Errorf("could not exchange tunnel parameters. %w", err)
+		_ = connToDevice.Close()
+		return Tunnel{}, coreTunnelSetupError(ctx, "could not exchange tunnel parameters", err)
 	}
 
 	utunIface, err := setupTunnelInterface(tunnelInfo)
 	if err != nil {
-		return Tunnel{}, fmt.Errorf("could not setup tunnel interface. %w", err)
+		_ = connToDevice.Close()
+		return Tunnel{}, coreTunnelSetupError(ctx, "could not setup tunnel interface", err)
 	}
 
-	// we want a copy of the parent ctx here, but it shouldn't time out/be cancelled at the same time.
-	// doing it like this allows us to have a context with a timeout for the tunnel creation, but the tunnel itself
-	tunnelCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-
-	go func() {
-		err := forwardTCPToInterface(tunnelCtx, tunnelInfo.ClientParameters.Mtu, connToDevice, utunIface)
-		if err != nil {
-			logrus.WithError(err).Error("failed to forward data to tunnel interface")
-		}
-	}()
-
-	go func() {
-		err := forwardTUNToDevice(tunnelCtx, tunnelInfo.ClientParameters.Mtu, utunIface, connToDevice)
-		if err != nil {
-			logrus.WithError(err).Error("failed to forward data to the device")
-		}
-	}()
-
-	closeFunc := func() error {
-		cancel()
-		return errors.Join(utunIface.Close(), connToDevice.Close())
+	runtime := startLockdownKernelTunnelRuntime(ctx, connToDevice, utunIface, tunnelInfo.ClientParameters.Mtu)
+	if !stopSetupWatcher() {
+		setupWatcherActive = false
+		_ = runtime.closeAndWait()
+		return Tunnel{}, coreTunnelSetupError(ctx, "lockdown tunnel setup canceled", nil)
+	}
+	setupWatcherActive = false
+	if err := ctx.Err(); err != nil {
+		_ = runtime.closeAndWait()
+		return Tunnel{}, err
 	}
 	return Tunnel{
 		Address: tunnelInfo.ServerAddress,
 		RsdPort: int(tunnelInfo.ServerRSDPort),
 		Udid:    device.Properties.SerialNumber,
-		closer:  closeFunc,
+		runtime: runtime,
 	}, nil
+}
+
+func coreTunnelSetupError(ctx context.Context, operation string, err error) error {
+	if ctx != nil && ctx.Err() != nil {
+		err = errors.Join(ctx.Err(), err)
+	}
+	if err == nil {
+		err = context.Canceled
+	}
+	return fmt.Errorf("%s: %w", operation, err)
+}
+
+func startLockdownKernelTunnelRuntime(ctx context.Context, connToDevice, utunIface io.ReadWriteCloser, mtu uint64) *tunnelRuntime {
+	closeResources := func() error {
+		return errors.Join(connToDevice.Close(), utunIface.Close())
+	}
+	return newTunnelRuntime(ctx, closeResources,
+		tunnelRuntimeWorker{name: "lockdown receive forwarding", run: func(workerCtx context.Context) error {
+			return forwardTCPToInterface(workerCtx, mtu, connToDevice, utunIface)
+		}},
+		tunnelRuntimeWorker{name: "lockdown send forwarding", run: func(workerCtx context.Context) error {
+			return forwardTUNToDevice(workerCtx, mtu, utunIface, connToDevice)
+		}},
+	)
 }
 
 func forwardTUNToDevice(ctx context.Context, mtu uint64, tun io.Reader, deviceConn io.Writer) error {

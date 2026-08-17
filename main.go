@@ -445,9 +445,11 @@ The commands work as following:
 	// log.SetReportCaller(true)
 	log.Debug(arguments)
 
+	tunnelCommand, _ := arguments.Bool("tunnel")
+	tunnelStartCommand, _ := arguments.Bool("start")
 	skipAgent, _ := os.LookupEnv("ENABLE_GO_IOS_AGENT")
-	if skipAgent == "user" || skipAgent == "kernel" {
-		tunnel.RunAgent(skipAgent)
+	if (skipAgent == "user" || skipAgent == "kernel") && !(tunnelCommand && tunnelStartCommand) {
+		exitIfError("failed to start go-ios agent", tunnel.RunAgent(skipAgent))
 	}
 
 	if !tunnel.IsAgentRunning() {
@@ -489,8 +491,6 @@ The commands work as following:
 	if err != nil {
 		tunnelInfoPort = ios.HttpApiPort()
 	}
-
-	tunnelCommand, _ := arguments.Bool("tunnel")
 
 	udid, _ := arguments.String("--udid")
 	if udid == "" {
@@ -1598,9 +1598,8 @@ The commands work as following:
 	}
 
 	if tunnelCommand {
-		startCommand, _ := arguments.Bool("start")
 		useUserspaceNetworking, _ := arguments.Bool("--userspace")
-		if startCommand && !useUserspaceNetworking {
+		if tunnelStartCommand && !useUserspaceNetworking {
 			err := tunnel.CheckPermissions()
 			exitIfError("If --userspace is not set, we need sudo, an admin shell on Windows, or CAP_NET_ADMIN on Linux", err)
 		}
@@ -1609,7 +1608,7 @@ The commands work as following:
 		}
 		stopagent, _ := arguments.Bool("stopagent")
 		listCommand, _ := arguments.Bool("ls")
-		if startCommand {
+		if tunnelStartCommand {
 			pairRecordsPath, _ := arguments.String("--pair-record-path")
 			if len(pairRecordsPath) == 0 {
 				pairRecordsPath = "."

@@ -1,12 +1,15 @@
 package ios
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/danielpaulus/go-ios/ios/http"
@@ -88,24 +91,133 @@ func (muxConn *UsbMuxConnection) ConnectLockdown(deviceID int) (*LockDownConnect
 }
 
 func ConnectToService(device DeviceEntry, serviceName string) (DeviceConnectionInterface, error) {
-	startServiceResponse, err := StartService(device, serviceName)
-	if err != nil {
+	return ConnectToServiceContext(context.Background(), device, serviceName)
+}
+
+type usbMuxConnectionContextFactory func(context.Context) (*UsbMuxConnection, error)
+
+// ConnectToServiceContext starts a lockdown service and connects to it while
+// making every blocking setup stage interruptible by ctx. The context only
+// controls setup; after this function succeeds, ownership of the returned
+// connection belongs to the caller.
+func ConnectToServiceContext(ctx context.Context, device DeviceEntry, serviceName string) (DeviceConnectionInterface, error) {
+	return connectToServiceContext(ctx, device, serviceName, NewUsbMuxConnectionSimpleContext)
+}
+
+func connectToServiceContext(ctx context.Context, device DeviceEntry, serviceName string, newMux usbMuxConnectionContextFactory) (DeviceConnectionInterface, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	pairRecord, err := ReadPairRecord(device.Properties.SerialNumber)
+
+	startServiceResponse, pairRecord, err := startServiceAndReadPairContext(ctx, device, serviceName, newMux)
 	if err != nil {
 		return nil, err
 	}
 
-	muxConn, err := NewUsbMuxConnectionSimple()
+	muxConn, err := newMux(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("Could not connect to usbmuxd socket, is it running? %w", err)
+		return nil, connectToServiceStageError(ctx, "dial service usbmux socket", err)
 	}
+	if muxConn == nil || muxConn.deviceConn == nil {
+		if muxConn != nil && muxConn.deviceConn != nil {
+			_ = muxConn.Close()
+		}
+		return nil, errors.New("ConnectToServiceContext: dial service usbmux socket: empty connection")
+	}
+	serviceConn := muxConn.deviceConn
+	serviceRawConn := serviceConn.Conn()
+	if serviceRawConn == nil {
+		_ = serviceConn.Close()
+		return nil, errors.New("ConnectToServiceContext: dial service usbmux socket: connection has no raw socket")
+	}
+	// Capture the stable raw socket before TLS can replace DeviceConnection.c.
+	// Calling DeviceConnection.Close from the watcher would race that swap.
+	guard := closeConnectionOnContext(ctx, serviceRawConn)
+	defer func() {
+		if muxConn.deviceConn != nil {
+			_ = muxConn.Close()
+		}
+		guard.Stop()
+	}()
+
 	err = muxConn.connectWithStartServiceResponse(device.DeviceID, startServiceResponse, pairRecord)
 	if err != nil {
-		return nil, err
+		return nil, connectToServiceStageError(ctx, "connect service and negotiate SSL", err)
 	}
-	return muxConn.ReleaseDeviceConnection(), nil
+
+	result := muxConn.ReleaseDeviceConnection()
+	if !guard.Stop() || ctx.Err() != nil {
+		_ = result.Close()
+		return nil, connectToServiceStageError(ctx, "finish service connection", nil)
+	}
+	return result, nil
+}
+
+func startServiceAndReadPairContext(ctx context.Context, device DeviceEntry, serviceName string, newMux usbMuxConnectionContextFactory) (StartServiceResponse, PairRecord, error) {
+	muxConn, err := newMux(ctx)
+	if err != nil {
+		return StartServiceResponse{}, PairRecord{}, connectToServiceStageError(ctx, "dial lockdown usbmux socket", err)
+	}
+	if muxConn == nil || muxConn.deviceConn == nil {
+		if muxConn != nil && muxConn.deviceConn != nil {
+			_ = muxConn.Close()
+		}
+		return StartServiceResponse{}, PairRecord{}, errors.New("ConnectToServiceContext: dial lockdown usbmux socket: empty connection")
+	}
+	lockdownDeviceConn := muxConn.deviceConn
+	lockdownRawConn := lockdownDeviceConn.Conn()
+	if lockdownRawConn == nil {
+		_ = lockdownDeviceConn.Close()
+		return StartServiceResponse{}, PairRecord{}, errors.New("ConnectToServiceContext: dial lockdown usbmux socket: connection has no raw socket")
+	}
+	// The lockdown session may install a TLS wrapper. Keep cancellation tied
+	// to the immutable raw socket rather than racing DeviceConnection.c.
+	guard := closeConnectionOnContext(ctx, lockdownRawConn)
+	defer func() {
+		_ = lockdownDeviceConn.Close()
+		guard.Stop()
+	}()
+
+	pairRecord, err := muxConn.ReadPair(device.Properties.SerialNumber)
+	if err != nil {
+		return StartServiceResponse{}, PairRecord{}, connectToServiceStageError(ctx, "read pair record", err)
+	}
+
+	lockdownConnection, err := muxConn.ConnectLockdown(device.DeviceID)
+	if err != nil {
+		return StartServiceResponse{}, PairRecord{}, connectToServiceStageError(ctx, "connect lockdown", err)
+	}
+	muxConn.ReleaseDeviceConnection()
+
+	if _, err := lockdownConnection.StartSession(pairRecord); err != nil {
+		return StartServiceResponse{}, PairRecord{}, connectToServiceStageError(ctx, "start lockdown session and negotiate SSL", err)
+	}
+
+	response, err := lockdownConnection.StartService(serviceName)
+	if err != nil {
+		return StartServiceResponse{}, PairRecord{}, connectToServiceStageError(ctx, "start service", err)
+	}
+
+	// Preserve the existing graceful lockdown cleanup. If StopSession itself
+	// stalls, cancellation still closes the same underlying connection.
+	lockdownConnection.StopSession()
+	if !guard.Stop() || ctx.Err() != nil {
+		return StartServiceResponse{}, PairRecord{}, connectToServiceStageError(ctx, "finish lockdown service start", nil)
+	}
+	return response, pairRecord, nil
+}
+
+func connectToServiceStageError(ctx context.Context, stage string, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = errors.Join(ctxErr, err)
+	}
+	if err == nil {
+		err = context.Canceled
+	}
+	return fmt.Errorf("ConnectToServiceContext: %s: %w", stage, err)
 }
 
 // ConnectToShimService opens a new connection of the tunnel interface of the provided device
@@ -282,24 +394,99 @@ func ConnectTUNDevice(remoteIp string, port int, d DeviceEntry) (*net.TCPConn, e
 		return connectTUN(remoteIp, port)
 	}
 
-	addr, _ := net.ResolveTCPAddr("tcp4", fmt.Sprintf("%s:%d", d.UserspaceTUNHost, d.UserspaceTUNPort))
-	conn, err := net.DialTCP("tcp", nil, addr)
+	conn, err := connectUserSpaceTUNDevice(remoteIp, port, d, net.ResolveTCPAddr, func(network string, localAddr, remoteAddr *net.TCPAddr) (userSpaceTUNClientConn, error) {
+		return net.DialTCP(network, localAddr, remoteAddr)
+	})
+	if err != nil {
+		return nil, err
+	}
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		_ = conn.Close()
+		return nil, fmt.Errorf("ConnectUserSpaceTunnel: dialer returned %T instead of *net.TCPConn", conn)
+	}
+	return tcpConn, nil
+}
+
+type userSpaceTUNClientConn interface {
+	net.Conn
+	SetKeepAlive(bool) error
+	SetKeepAlivePeriod(time.Duration) error
+}
+
+type userSpaceTUNAddressResolver func(network, address string) (*net.TCPAddr, error)
+type userSpaceTUNDialer func(network string, localAddr, remoteAddr *net.TCPAddr) (userSpaceTUNClientConn, error)
+
+func connectUserSpaceTUNDevice(remoteIP string, remotePort int, device DeviceEntry, resolve userSpaceTUNAddressResolver, dial userSpaceTUNDialer) (userSpaceTUNClientConn, error) {
+	parsedRemoteIP := net.ParseIP(remoteIP).To16()
+	if parsedRemoteIP == nil {
+		return nil, fmt.Errorf("ConnectUserSpaceTunnel: invalid remote IP %q", remoteIP)
+	}
+	if remotePort < 1 || remotePort > 65535 {
+		return nil, fmt.Errorf("ConnectUserSpaceTunnel: invalid remote port %d", remotePort)
+	}
+	if device.UserspaceTUNPort < 1 || device.UserspaceTUNPort > 65535 {
+		return nil, fmt.Errorf("ConnectUserSpaceTunnel: invalid userspace tunnel port %d", device.UserspaceTUNPort)
+	}
+	if strings.TrimSpace(device.UserspaceTUNHost) == "" {
+		return nil, errors.New("ConnectUserSpaceTunnel: userspace tunnel host is empty")
+	}
+
+	address := net.JoinHostPort(device.UserspaceTUNHost, strconv.Itoa(device.UserspaceTUNPort))
+	resolvedAddr, err := resolve("tcp4", address)
+	if err != nil {
+		return nil, fmt.Errorf("ConnectUserSpaceTunnel: failed to resolve %s: %w", address, err)
+	}
+	if resolvedAddr == nil {
+		return nil, fmt.Errorf("ConnectUserSpaceTunnel: resolver returned a nil address for %s", address)
+	}
+	conn, err := dial("tcp", nil, resolvedAddr)
 	if err != nil {
 		return nil, fmt.Errorf("ConnectUserSpaceTunnel: failed to dial: %w", err)
 	}
-	err = conn.SetKeepAlive(true)
-	if err != nil {
+	if conn == nil {
+		return nil, errors.New("ConnectUserSpaceTunnel: dialer returned a nil connection")
+	}
+	keepConn := false
+	defer func() {
+		if !keepConn {
+			_ = conn.Close()
+		}
+	}()
+
+	if err := conn.SetKeepAlive(true); err != nil {
 		return nil, fmt.Errorf("ConnectUserSpaceTunnel: failed to set keepalive: %w", err)
 	}
-	err = conn.SetKeepAlivePeriod(1 * time.Second)
-	if err != nil {
+	if err := conn.SetKeepAlivePeriod(1 * time.Second); err != nil {
 		return nil, fmt.Errorf("ConnectUserSpaceTunnel: failed to set keepalive period: %w", err)
 	}
-	_, err = conn.Write(net.ParseIP(remoteIp).To16())
-	portBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(portBytes, uint32(port))
-	_, err1 := conn.Write(portBytes)
-	return conn, errors.Join(err, err1)
+
+	header := make([]byte, net.IPv6len+4)
+	copy(header, parsedRemoteIP)
+	binary.LittleEndian.PutUint32(header[net.IPv6len:], uint32(remotePort))
+	if _, err := writeAll(conn, header); err != nil {
+		return nil, fmt.Errorf("ConnectUserSpaceTunnel: failed to write destination header: %w", err)
+	}
+	keepConn = true
+	return conn, nil
+}
+
+func writeAll(writer io.Writer, data []byte) (int, error) {
+	written := 0
+	for written < len(data) {
+		n, err := writer.Write(data[written:])
+		if n < 0 || n > len(data)-written {
+			return written, fmt.Errorf("invalid write count %d", n)
+		}
+		written += n
+		if err != nil {
+			return written, err
+		}
+		if n == 0 {
+			return written, io.ErrNoProgress
+		}
+	}
+	return written, nil
 }
 
 // connect to a operating system level TUN device
@@ -312,6 +499,12 @@ func connectTUN(address string, port int) (*net.TCPConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ConnectToHttp2WithAddr: failed to dial: %w", err)
 	}
+	keepConn := false
+	defer func() {
+		if !keepConn {
+			_ = conn.Close()
+		}
+	}()
 	err = conn.SetKeepAlive(true)
 	if err != nil {
 		return nil, fmt.Errorf("ConnectUserSpaceTunnel: failed to set keepalive: %w", err)
@@ -321,6 +514,7 @@ func connectTUN(address string, port int) (*net.TCPConn, error) {
 		return nil, fmt.Errorf("ConnectUserSpaceTunnel: failed to set keepalive period: %w", err)
 	}
 
+	keepConn = true
 	return conn, nil
 }
 

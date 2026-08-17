@@ -1,6 +1,7 @@
 package ios
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"io"
@@ -122,8 +123,26 @@ func (conn *DeviceConnection) Write(p []byte) (n int, err error) {
 
 // NewDeviceConnection creates a new DeviceConnection pointing to the given socket waiting for a call to Connect()
 func NewDeviceConnection(socketToConnectTo string) (*DeviceConnection, error) {
+	return NewDeviceConnectionContext(context.Background(), socketToConnectTo)
+}
+
+// NewDeviceConnectionContext creates a new DeviceConnection and makes the
+// socket dial interruptible by ctx. Cancellation after the socket is connected
+// is handled by the caller that owns the protocol stage, because a successful
+// connection must not remain tied to a setup-only context.
+func NewDeviceConnectionContext(ctx context.Context, socketToConnectTo string) (*DeviceConnection, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	dialer := &net.Dialer{}
+	return newDeviceConnectionContext(ctx, socketToConnectTo, dialer.DialContext)
+}
+
+type deviceConnectionContextDialer func(context.Context, string, string) (net.Conn, error)
+
+func newDeviceConnectionContext(ctx context.Context, socketToConnectTo string, dial deviceConnectionContextDialer) (*DeviceConnection, error) {
 	conn := &DeviceConnection{}
-	return conn, conn.connectToSocketAddress(socketToConnectTo)
+	return conn, conn.connectToSocketAddressContext(ctx, socketToConnectTo, dial)
 }
 
 // NewDeviceConnectionWithConn create a DeviceConnection with a already connected network conn.
@@ -133,11 +152,16 @@ func NewDeviceConnectionWithConn(conn net.Conn) *DeviceConnection {
 
 // ConnectToSocketAddress connects to the USB multiplexer with a specified socket addres
 func (conn *DeviceConnection) connectToSocketAddress(socketAddress string) error {
+	dialer := &net.Dialer{}
+	return conn.connectToSocketAddressContext(context.Background(), socketAddress, dialer.DialContext)
+}
+
+func (conn *DeviceConnection) connectToSocketAddressContext(ctx context.Context, socketAddress string, dial deviceConnectionContextDialer) error {
 	if strings.HasPrefix(socketAddress, "/var") {
 		socketAddress = "unix://" + socketAddress
 	}
 	network, address := GetSocketTypeAndAddress(socketAddress)
-	c, err := net.Dial(network, address)
+	c, err := dial(ctx, network, address)
 	if err != nil {
 		return err
 	}

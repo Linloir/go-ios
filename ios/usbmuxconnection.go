@@ -1,6 +1,7 @@
 package ios
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -63,7 +64,13 @@ func NewUsbMuxConnection(deviceConn DeviceConnectionInterface) *UsbMuxConnection
 
 // NewUsbMuxConnectionSimple creates a new UsbMuxConnection with a connection to /var/run/usbmuxd
 func NewUsbMuxConnectionSimple() (*UsbMuxConnection, error) {
-	deviceConn, err := NewDeviceConnection(GetUsbmuxdSocket())
+	return NewUsbMuxConnectionSimpleContext(context.Background())
+}
+
+// NewUsbMuxConnectionSimpleContext creates a new usbmux connection whose
+// socket dial can be interrupted by ctx.
+func NewUsbMuxConnectionSimpleContext(ctx context.Context) (*UsbMuxConnection, error) {
+	deviceConn, err := NewDeviceConnectionContext(ctx, GetUsbmuxdSocket())
 	muxConn := &UsbMuxConnection{tag: 0, deviceConn: deviceConn}
 	return muxConn, err
 }
