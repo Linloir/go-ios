@@ -26,11 +26,18 @@ func (p loggingDispatcher) Dispatch(m dtx.Message) {
 }
 
 func connectInstrumentsWithMsgDispatcher(device ios.DeviceEntry, dispatcher dtx.Dispatcher) (*dtx.Connection, error) {
-	dtxConn, err := connectInstruments(device)
-	if err != nil {
-		return nil, err
+	if device.SupportsRsd() {
+		log.Debugf("Connecting to %s", serviceNameRsd)
+		return dtx.NewTunnelConnectionWithDispatcher(device, serviceNameRsd, dispatcher)
 	}
-	dtxConn.MessageDispatcher = dispatcher
+	dtxConn, err := dtx.NewUsbmuxdConnectionWithDispatcher(device, serviceName, dispatcher)
+	if err != nil {
+		log.Debugf("Failed connecting to %s, trying %s", serviceName, serviceNameiOS14)
+		dtxConn, err = dtx.NewUsbmuxdConnectionWithDispatcher(device, serviceNameiOS14, dispatcher)
+		if err != nil {
+			return nil, err
+		}
+	}
 	log.Debugf("msg dispatcher: %v attached to instruments connection", reflect.TypeOf(dispatcher))
 
 	return dtxConn, nil

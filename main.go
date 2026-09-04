@@ -905,6 +905,7 @@ The commands work as following:
 		if device.SupportsRsd() {
 			server, err := instruments.NewLocationSimulationService(device)
 			exitIfError("failed to create location simulation service:", err)
+			defer server.Close()
 
 			startLocationSimulation(server, lat, lon)
 			return
@@ -1077,6 +1078,7 @@ The commands work as following:
 		}
 		pControl, err := instruments.NewProcessControl(device)
 		exitIfError("processcontrol failed", err)
+		defer pControl.Close()
 		opts := map[string]any{}
 		if bKillExisting {
 			opts["KillExisting"] = 1
@@ -1138,7 +1140,10 @@ The commands work as following:
 		}
 		pControl, err := instruments.NewProcessControl(device)
 		exitIfError("processcontrol failed", err)
-		svc, _ := installationproxy.New(device)
+		defer pControl.Close()
+		svc, err := installationproxy.New(device)
+		exitIfError("installation proxy failed", err)
+		defer svc.Close()
 
 		// Look for correct process exe name for this bundleID. By default, searches only user-installed apps.
 		if bundleID != "" {
@@ -1159,8 +1164,8 @@ The commands work as following:
 		}
 
 		service, err := instruments.NewDeviceInfoService(device)
-		defer service.Close()
 		exitIfError("failed opening deviceInfoService for getting process list", err)
+		defer service.Close()
 		processList, _ := service.ProcessList()
 		// ps
 		for _, p := range processList {
@@ -1947,6 +1952,7 @@ func crashCommand(device ios.DeviceEntry, arguments docopt.Opts) bool {
 func deviceState(device ios.DeviceEntry, list bool, enable bool, profileTypeId string, profileId string) {
 	control, err := instruments.NewDeviceStateControl(device)
 	exitIfError("failed to connect to deviceStateControl", err)
+	defer control.Close()
 	profileTypes, err := control.List()
 	if list {
 		if JSONdisabled {
@@ -2014,6 +2020,7 @@ func installApp(device ios.DeviceEntry, path string) {
 		log.Fields{"appPath": path, "device": device.Properties.SerialNumber}).Info("installing")
 	conn, err := zipconduit.New(device)
 	exitIfError("failed connecting to zipconduit, dev image installed?", err)
+	defer conn.Close()
 	err = conn.SendFile(path)
 	exitIfError("failed writing", err)
 }
@@ -2023,6 +2030,7 @@ func uninstallApp(device ios.DeviceEntry, bundleId string) {
 		log.Fields{"appPath": bundleId, "device": device.Properties.SerialNumber}).Info("uninstalling")
 	svc, err := installationproxy.New(device)
 	exitIfError("failed connecting to installationproxy", err)
+	defer svc.Close()
 	err = svc.Uninstall(bundleId)
 	exitIfError("failed uninstalling", err)
 }
@@ -2234,6 +2242,7 @@ func startAx(device ios.DeviceEntry, arguments docopt.Opts) {
 	go func() {
 		conn, err := accessibility.NewWithoutEventChangeListeners(device)
 		exitIfError("failed starting ax", err)
+		defer conn.Close()
 
 		conn.SwitchToDevice()
 
@@ -2264,6 +2273,7 @@ func startAx(device ios.DeviceEntry, arguments docopt.Opts) {
 func resetAx(device ios.DeviceEntry) {
 	conn, err := accessibility.NewWithoutEventChangeListeners(device)
 	exitIfError("failed creating ax service", err)
+	defer conn.Close()
 
 	err = conn.ResetToDefaultAccessibilitySettings()
 	exitIfError("failed resetting ax", err)
@@ -2450,8 +2460,9 @@ func printDeviceDate(device ios.DeviceEntry) {
 }
 
 func printInstalledApps(device ios.DeviceEntry, system bool, all bool, list bool, filesharing bool) {
-	svc, _ := installationproxy.New(device)
-	var err error
+	svc, err := installationproxy.New(device)
+	exitIfError("failed connecting to installationproxy", err)
+	defer svc.Close()
 	var response []installationproxy.AppInfo
 	appType := ""
 	if all {
@@ -2566,10 +2577,10 @@ func resetLocation(device ios.DeviceEntry) {
 
 func processList(device ios.DeviceEntry, applicationsOnly bool) {
 	service, err := instruments.NewDeviceInfoService(device)
-	defer service.Close()
 	if err != nil {
 		exitIfError("failed opening deviceInfoService for getting process list", err)
 	}
+	defer service.Close()
 	processList, err := service.ProcessList()
 	if applicationsOnly {
 		var applicationProcessList []instruments.ProcessInfo
@@ -2642,18 +2653,21 @@ func outputProcessListNoJSON(device ios.DeviceEntry, processes []instruments.Pro
 	sort.Slice(processes, func(i, j int) bool {
 		return processes[i].Pid < processes[j].Pid
 	})
-	svc, _ := installationproxy.New(device)
-	response, err := svc.BrowseAllApps()
 	appInfoByExecutableName := make(map[string]installationproxy.AppInfo)
-
+	svc, err := installationproxy.New(device)
 	if err != nil {
-		log.Error("browsing installed apps failed. bundleID will not be included in output")
+		log.Error("connecting to installationproxy failed. bundleID will not be included in output")
 	} else {
-		for _, app := range response {
-			appInfoByExecutableName[app.CFBundleExecutable()] = app
+		defer svc.Close()
+		response, browseErr := svc.BrowseAllApps()
+		if browseErr != nil {
+			log.Error("browsing installed apps failed. bundleID will not be included in output")
+		} else {
+			for _, app := range response {
+				appInfoByExecutableName[app.CFBundleExecutable()] = app
+			}
 		}
 	}
-
 	var maxPid uint64
 	maxNameLength := 15
 
@@ -2681,35 +2695,36 @@ func outputProcessListNoJSON(device ios.DeviceEntry, processes []instruments.Pro
 func startListening() {
 	go func() {
 		for {
-			deviceConn, err := ios.NewDeviceConnection(ios.GetUsbmuxdSocket())
-			defer deviceConn.Close()
-			if err != nil {
-				log.Errorf("could not connect to %s with err %+v, will retry in 3 seconds...", ios.GetUsbmuxdSocket(), err)
-				time.Sleep(time.Second * 3)
-				continue
+			if err := listenForDeviceEventsOnce(); err != nil {
+				log.Errorf("device event listener stopped: %v; retrying in 3 seconds", err)
 			}
-			muxConnection := ios.NewUsbMuxConnection(deviceConn)
-
-			attachedReceiver, err := muxConnection.Listen()
-			if err != nil {
-				log.Error("Failed issuing Listen command, will retry in 3 seconds", err)
-				deviceConn.Close()
-				time.Sleep(time.Second * 3)
-				continue
-			}
-			for {
-				msg, err := attachedReceiver()
-				if err != nil {
-					log.Error("Stopped listening because of error")
-					break
-				}
-				fmt.Println(convertToJSONString((msg)))
-			}
+			time.Sleep(3 * time.Second)
 		}
 	}()
 	c := make(chan os.Signal, syscall.SIGTERM)
-	signal.Notify(c, os.Interrupt)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	<-c
+}
+
+func listenForDeviceEventsOnce() error {
+	deviceConn, err := ios.NewDeviceConnection(ios.GetUsbmuxdSocket())
+	if err != nil {
+		return fmt.Errorf("connect to %s: %w", ios.GetUsbmuxdSocket(), err)
+	}
+	defer deviceConn.Close()
+
+	muxConnection := ios.NewUsbMuxConnection(deviceConn)
+	attachedReceiver, err := muxConnection.Listen()
+	if err != nil {
+		return fmt.Errorf("issue Listen command: %w", err)
+	}
+	for {
+		msg, err := attachedReceiver()
+		if err != nil {
+			return fmt.Errorf("receive device event: %w", err)
+		}
+		fmt.Println(convertToJSONString(msg))
+	}
 }
 
 func printDeviceInfo(device ios.DeviceEntry) {
@@ -2722,6 +2737,7 @@ func printDeviceInfo(device ios.DeviceEntry) {
 		log.Debugf("could not open instruments, probably dev image not mounted %v", err)
 	}
 	if err == nil {
+		defer svc.Close()
 		info, err := svc.NetworkInformation()
 		if err != nil {
 			log.Debugf("error getting networkinfo from instruments %v", err)

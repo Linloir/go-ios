@@ -81,13 +81,10 @@ func (conn *DeviceConnectionRWC) Reader() io.Reader {
 
 // Send implements DeviceConnectionInterface.
 func (conn *DeviceConnectionRWC) Send(message []byte) error {
-	n, err := conn.c.Write(message)
-	if n < len(message) {
-		log.Errorf("DeviceConnection failed writing %d bytes, only %d sent", len(message), n)
-	}
+	_, err := writeAll(conn.c, message)
 	if err != nil {
 		log.Errorf("Failed sending: %s", err)
-		conn.Close()
+		_ = conn.Close()
 		return err
 	}
 	return nil
@@ -178,13 +175,10 @@ func (conn *DeviceConnection) Close() error {
 
 // Send sends a message
 func (conn *DeviceConnection) Send(bytes []byte) error {
-	n, err := conn.c.Write(bytes)
-	if n < len(bytes) {
-		log.Errorf("DeviceConnection failed writing %d bytes, only %d sent", len(bytes), n)
-	}
+	_, err := writeAll(conn.c, bytes)
 	if err != nil {
 		log.Errorf("Failed sending: %s", err)
-		conn.Close()
+		_ = conn.Close()
 		return err
 	}
 	return nil

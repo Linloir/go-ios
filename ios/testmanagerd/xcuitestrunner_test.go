@@ -63,8 +63,13 @@ func TestXcuiTest(t *testing.T) {
 		return
 	}
 
-	errorChannel := make(chan error)
+	errorChannel := make(chan error, 1)
 	ctx, stopWda := context.WithCancel(context.Background())
+	pollDone := make(chan struct{})
+	defer func() {
+		stopWda()
+		<-pollDone
+	}()
 	bundleID, testbundleID, xctestconfig := "com.facebook.WebDriverAgentRunner.xctrunner", "com.facebook.WebDriverAgentRunner.xctrunner", "WebDriverAgentRunner.xctest"
 	var wdaargs []string
 	var wdaenv map[string]interface{}
@@ -79,18 +84,23 @@ func TestXcuiTest(t *testing.T) {
 			Listener:           testmanagerd.NewTestListener(os.Stdout, os.Stdout, os.TempDir()),
 		})
 		if err != nil {
-			log.WithFields(log.Fields{"error": err}).Fatal("Failed running WDA")
-			errorChannel <- err
+			log.WithFields(log.Fields{"error": err}).Error("Failed running WDA")
 		}
+		errorChannel <- err
 	}()
 
-	wdaStarted := make(chan bool)
-	pollLogs(hook, wdaStarted)
+	wdaStarted := make(chan struct{}, 1)
+	pollLogs(ctx, hook, wdaStarted, pollDone)
 
 	select {
 	case <-time.After(time.Second * 50):
 		t.Error("timeout")
 		stopWda()
+		select {
+		case <-errorChannel:
+		case <-time.After(10 * time.Second):
+			t.Error("timed out waiting for WDA cleanup")
+		}
 		return
 	case <-wdaStarted:
 		log.Info("wda started successfully")
@@ -106,14 +116,25 @@ func TestXcuiTest(t *testing.T) {
 	}
 }
 
-func pollLogs(hook *test.Hook, wdaStarted chan bool) {
+func pollLogs(ctx context.Context, hook *test.Hook, wdaStarted chan<- struct{}, done chan<- struct{}) {
 	go func() {
+		defer close(done)
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
 		for {
-			entries := hook.AllEntries()
-			for _, e := range entries {
-				if strings.Contains(e.Message, wdaSuccessLogMessage) {
-					wdaStarted <- true
-					return
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				entries := hook.AllEntries()
+				for _, e := range entries {
+					if strings.Contains(e.Message, wdaSuccessLogMessage) {
+						select {
+						case wdaStarted <- struct{}{}:
+						default:
+						}
+						return
+					}
 				}
 			}
 		}
@@ -121,8 +142,15 @@ func pollLogs(hook *test.Hook, wdaStarted chan bool) {
 }
 
 func signAndInstall(device ios.DeviceEntry) error {
-	svc, _ := installationproxy.New(device)
+	svc, err := installationproxy.New(device)
+	if err != nil {
+		return err
+	}
+	defer svc.Close()
 	response, err := svc.BrowseUserApps()
+	if err != nil {
+		return err
+	}
 	for _, info := range response {
 		if bundleId == info.CFBundleIdentifier() {
 			log.Info("wda installed, skipping installation")

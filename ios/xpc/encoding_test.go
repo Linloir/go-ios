@@ -28,6 +28,7 @@ func TestDictionary(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, Message{
 		Flags: AlwaysSetFlag | DataFlag | HeartbeatRequestFlag,
+		Id:    1,
 		Body: map[string]interface{}{
 			"CoreDevice.CoreDeviceDDIProtocolVersion": int64(0),
 			"CoreDevice.action":                       map[string]interface{}{},

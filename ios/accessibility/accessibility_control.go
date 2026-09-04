@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"time"
 
 	dtx "github.com/danielpaulus/go-ios/ios/dtx_codec"
 	"github.com/danielpaulus/go-ios/ios/nskeyedarchiver"
@@ -29,6 +30,8 @@ type ControlInterface struct {
 	channel  *dtx.Channel
 	notifier AccessibilityInspectorNotifier
 }
+
+const accessibilityEventTimeout = 5 * time.Second
 
 // Close shuts down the connection.
 func (a *ControlInterface) Close() error {
@@ -191,7 +194,9 @@ func (a *ControlInterface) SwitchToDevice() {
 	a.deviceInspectorShowIgnoredElements(false)
 	a.deviceSetAuditTargetPid(0)
 	a.deviceInspectorFocusOnElement()
-	_, err := a.awaitHostInspectorCurrentElementChanged(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), accessibilityEventTimeout)
+	_, err := a.awaitHostInspectorCurrentElementChanged(ctx)
+	cancel()
 	if err != nil {
 		log.Warnf("await element change failed during SwitchToDevice: %v", err)
 	}
@@ -204,7 +209,9 @@ func (a *ControlInterface) TurnOff() {
 	a.deviceInspectorSetMonitoredEventType(0)
 	a.awaitHostInspectorMonitoredEventTypeChanged()
 	a.deviceInspectorFocusOnElement()
-	_, err := a.awaitHostInspectorCurrentElementChanged(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), accessibilityEventTimeout)
+	_, err := a.awaitHostInspectorCurrentElementChanged(ctx)
+	cancel()
 	if err != nil {
 		log.Warnf("await element change failed during TurnOff: %v", err)
 	}
@@ -466,17 +473,52 @@ func (a *ControlInterface) awaitHostInspectorCurrentElementChanged(ctx context.C
 		return nil, fmt.Errorf("failed to receive hostInspectorCurrentElementChanged: %w", err)
 	}
 	log.Info("received hostInspectorCurrentElementChanged")
-	result, err := nskeyedarchiver.Unarchive(msg.Auxiliary.GetArguments()[0].([]byte))
-	if err != nil {
-		panic(fmt.Sprintf("Failed unarchiving: %s this is a bug and should not happen", err))
+	arguments := msg.Auxiliary.GetArguments()
+	if len(arguments) == 0 {
+		return nil, fmt.Errorf("hostInspectorCurrentElementChanged returned no arguments")
 	}
-	return result[0].(map[string]interface{}), nil
+	raw, ok := arguments[0].([]byte)
+	if !ok {
+		return nil, fmt.Errorf("hostInspectorCurrentElementChanged returned %T, expected []byte", arguments[0])
+	}
+	result, err := nskeyedarchiver.Unarchive(raw)
+	if err != nil {
+		return nil, fmt.Errorf("unarchive hostInspectorCurrentElementChanged: %w", err)
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("hostInspectorCurrentElementChanged decoded an empty result")
+	}
+	element, ok := result[0].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("hostInspectorCurrentElementChanged decoded %T, expected map", result[0])
+	}
+	return element, nil
 }
 
 func (a *ControlInterface) awaitHostInspectorMonitoredEventTypeChanged() {
-	msg := a.channel.ReceiveMethodCall("hostInspectorMonitoredEventTypeChanged:")
-	n, _ := nskeyedarchiver.Unarchive(msg.Auxiliary.GetArguments()[0].([]byte))
-	log.Infof("hostInspectorMonitoredEventTypeChanged: was set to %d by the device", n[0])
+	ctx, cancel := context.WithTimeout(context.Background(), accessibilityEventTimeout)
+	defer cancel()
+	msg, err := a.channel.ReceiveMethodCallWithTimeout(ctx, "hostInspectorMonitoredEventTypeChanged:")
+	if err != nil {
+		log.WithError(err).Warn("waiting for hostInspectorMonitoredEventTypeChanged failed")
+		return
+	}
+	arguments := msg.Auxiliary.GetArguments()
+	if len(arguments) == 0 {
+		log.Warn("hostInspectorMonitoredEventTypeChanged returned no arguments")
+		return
+	}
+	raw, ok := arguments[0].([]byte)
+	if !ok {
+		log.Warnf("hostInspectorMonitoredEventTypeChanged returned %T, expected []byte", arguments[0])
+		return
+	}
+	values, err := nskeyedarchiver.Unarchive(raw)
+	if err != nil || len(values) == 0 {
+		log.WithError(err).Warn("failed decoding hostInspectorMonitoredEventTypeChanged")
+		return
+	}
+	log.Infof("hostInspectorMonitoredEventTypeChanged: was set to %v by the device", values[0])
 }
 
 func (a *ControlInterface) deviceInspectorMoveWithOptions(direction MoveDirection) {

@@ -24,12 +24,16 @@ import (
 // @Router       /device/{udid}/apps [post]
 func ListApps(c *gin.Context) {
 	device := c.MustGet(IOS_KEY).(ios.DeviceEntry)
-	svc, _ := installationproxy.New(device)
-	var err error
-	var response []installationproxy.AppInfo
-	response, err = svc.BrowseAllApps()
+	svc, err := installationproxy.New(device)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, GenericResponse{Error: err.Error()})
+		return
+	}
+	defer svc.Close()
+	response, err := svc.BrowseAllApps()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, GenericResponse{Error: err.Error()})
+		return
 	}
 	c.IndentedJSON(http.StatusOK, response)
 }
@@ -57,6 +61,7 @@ func LaunchApp(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, GenericResponse{Error: err.Error()})
 		return
 	}
+	defer pControl.Close()
 
 	_, err = pControl.LaunchApp(bundleID, nil)
 	if err != nil {
@@ -91,12 +96,14 @@ func KillApp(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, GenericResponse{Error: err.Error()})
 		return
 	}
+	defer pControl.Close()
 
 	svc, err := installationproxy.New(device)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, GenericResponse{Error: err.Error()})
 		return
 	}
+	defer svc.Close()
 
 	response, err := svc.BrowseAllApps()
 	if err != nil {
@@ -105,8 +112,8 @@ func KillApp(c *gin.Context) {
 	}
 
 	for _, app := range response {
-		if app.CFBundleIdentifier == bundleID {
-			processName = app.CFBundleExecutable
+		if app.CFBundleIdentifier() == bundleID {
+			processName = app.CFBundleExecutable()
 			break
 		}
 	}
@@ -156,13 +163,11 @@ func KillApp(c *gin.Context) {
 func InstallApp(c *gin.Context) {
 	device := c.MustGet(IOS_KEY).(ios.DeviceEntry)
 	file, err := c.FormFile("file")
-
-	log.Printf("Received file: %s", file.Filename)
-
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, GenericResponse{Error: "file form-data is missing"})
 		return
 	}
+	log.Printf("Received file: %s", file.Filename)
 
 	if file.Size == 0 { // 100 MB limit
 		c.JSON(http.StatusRequestEntityTooLarge, GenericResponse{Error: "uploaded file is empty"})
@@ -186,13 +191,17 @@ func InstallApp(c *gin.Context) {
 		}
 	}()
 
-	c.SaveUploadedFile(file, dst)
+	if err := c.SaveUploadedFile(file, dst); err != nil {
+		c.JSON(http.StatusInternalServerError, GenericResponse{Error: "failed to save uploaded app"})
+		return
+	}
 
 	conn, err := zipconduit.New(device)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, GenericResponse{Error: "Unable to setup ZipConduit connection"})
 		return
 	}
+	defer conn.Close()
 
 	err = conn.SendFile(dst)
 	if err != nil {

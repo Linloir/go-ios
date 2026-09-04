@@ -93,5 +93,9 @@ func Listen() (func() (AttachedMessage, error), func() error, error) {
 	muxConnection := NewUsbMuxConnection(deviceConn)
 
 	attachedReceiver, err := muxConnection.Listen()
+	if err != nil {
+		_ = muxConnection.Close()
+		return nil, nil, err
+	}
 	return attachedReceiver, muxConnection.Close, err
 }

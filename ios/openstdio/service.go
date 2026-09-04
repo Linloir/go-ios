@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 
 	"github.com/danielpaulus/go-ios/ios"
 	"github.com/google/uuid"
 )
+
+const openStdIOHandshakeTimeout = 10 * time.Second
 
 // Connection is a single connection to the stdio socket
 type Connection struct {
@@ -31,21 +34,39 @@ func NewOpenStdIoSocket(device ios.DeviceEntry) (Connection, error) {
 		return Connection{}, fmt.Errorf("NewOpenStdIoSocket: failed to open connection: %w", err)
 	}
 
-	uuidBytes := make([]byte, 16)
-	_, err = conn.Read(uuidBytes)
+	u, err := readOpenStdIOUUID(conn, openStdIOHandshakeTimeout)
 	if err != nil {
-		return Connection{}, fmt.Errorf("NewOpenStdIoSocket: failed to read UUID: %w", err)
-	}
-
-	u, err := uuid.FromBytes(uuidBytes)
-	if err != nil {
-		return Connection{}, fmt.Errorf("NewOpenStdIoSocket: failed to parse UUID: %w", err)
+		_ = conn.Close()
+		return Connection{}, fmt.Errorf("NewOpenStdIoSocket: failed UUID handshake: %w", err)
 	}
 
 	return Connection{
 		ID:         u,
 		connection: conn,
 	}, nil
+}
+
+func readOpenStdIOUUID(conn net.Conn, timeout time.Duration) (uuid.UUID, error) {
+	if timeout <= 0 {
+		return uuid.Nil, errors.New("open stdio UUID handshake timeout must be positive")
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return uuid.Nil, fmt.Errorf("set UUID read deadline: %w", err)
+	}
+	uuidBytes := make([]byte, 16)
+	_, readErr := io.ReadFull(conn, uuidBytes)
+	clearErr := conn.SetReadDeadline(time.Time{})
+	if readErr != nil {
+		return uuid.Nil, fmt.Errorf("read UUID: %w", readErr)
+	}
+	if clearErr != nil {
+		return uuid.Nil, fmt.Errorf("clear UUID read deadline: %w", clearErr)
+	}
+	u, err := uuid.FromBytes(uuidBytes)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("parse UUID: %w", err)
+	}
+	return u, nil
 }
 
 // Read reads from the connected stdio-socket

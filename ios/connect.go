@@ -234,6 +234,7 @@ func ConnectToShimService(device DeviceEntry, service string) (DeviceConnectionI
 	}
 	err = RsdCheckin(conn)
 	if err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
 	return NewDeviceConnectionWithRWC(conn), nil
@@ -273,10 +274,78 @@ func ConnectToServiceTunnelIface(device DeviceEntry, serviceName string) (Device
 	return NewDeviceConnectionWithRWC(conn), nil
 }
 
+const defaultXPCInitializationTimeout = 10 * time.Second
+
 func CreateXpcConnection(h *http.HttpConnection) (*xpc.Connection, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultXPCInitializationTimeout)
+	defer cancel()
+	return CreateXpcConnectionContext(ctx, h)
+}
+
+// CreateXpcConnectionContext performs the RemoteXPC handshake with a bounded
+// lifetime. It takes ownership of h: failures close it, while a successful
+// return transfers ownership to the returned xpc.Connection. The context only
+// governs initialization and cannot close an established connection later.
+func CreateXpcConnectionContext(ctx context.Context, h *http.HttpConnection) (*xpc.Connection, error) {
+	if h == nil {
+		return nil, errors.New("CreateXpcConnection: nil HTTP connection")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		_ = h.Close()
+		return nil, fmt.Errorf("CreateXpcConnection: initialization canceled before start: %w", err)
+	}
+
+	keepOpen := false
+	defer func() {
+		if !keepOpen {
+			_ = h.Close()
+		}
+	}()
+
+	// Closing h is the generic cancellation mechanism for transports that do
+	// not expose deadlines. Stop and join the watcher before returning success,
+	// so expiration of the setup context cannot later close the live session.
+	stopWatch := make(chan struct{})
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-ctx.Done():
+			_ = h.Close()
+		case <-stopWatch:
+		}
+	}()
+	watchStopped := false
+	stopInitializationWatch := func() {
+		if watchStopped {
+			return
+		}
+		close(stopWatch)
+		<-watchDone
+		watchStopped = true
+	}
+	defer stopInitializationWatch()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := h.SetDeadline(deadline); err != nil {
+			return nil, xpcInitializationError(ctx, "failed to set initialization deadline", err)
+		}
+	}
+
 	err := initializeXpcConnection(h)
 	if err != nil {
-		return nil, fmt.Errorf("CreateXpcConnection: failed to initialize xpc connection: %w", err)
+		return nil, xpcInitializationError(ctx, "failed to initialize xpc connection", err)
+	}
+
+	stopInitializationWatch()
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("CreateXpcConnection: initialization did not complete before context ended: %w", err)
+	}
+	if err := h.SetDeadline(time.Time{}); err != nil {
+		return nil, fmt.Errorf("CreateXpcConnection: failed to clear initialization deadline: %w", err)
 	}
 
 	clientServerChannel := http.NewStreamReadWriter(h, http.ClientServer)
@@ -287,7 +356,18 @@ func CreateXpcConnection(h *http.HttpConnection) (*xpc.Connection, error) {
 		return nil, fmt.Errorf("CreateXpcConnection: failed to create xpc connection: %w", err)
 	}
 
+	keepOpen = true
 	return xpcConn, nil
+}
+
+func xpcInitializationError(ctx context.Context, stage string, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("CreateXpcConnection: %s: %w", stage, ctxErr)
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return fmt.Errorf("CreateXpcConnection: %s: %w", stage, context.DeadlineExceeded)
+	}
+	return fmt.Errorf("CreateXpcConnection: %s: %w", stage, err)
 }
 
 // connectWithStartServiceResponse issues a Connect Message to UsbMuxd for the given deviceID on the given port
@@ -319,7 +399,13 @@ func ConnectLockdownWithSession(device DeviceEntry) (*LockDownConnection, error)
 	if err != nil {
 		return nil, fmt.Errorf("USBMuxConnection failed with: %v", err)
 	}
-	defer muxConnection.ReleaseDeviceConnection()
+	// Keep ownership in muxConnection until the session is fully established.
+	// ReleaseDeviceConnection only detaches the pointer; it does not close it.
+	defer func() {
+		if muxConnection.deviceConn != nil {
+			_ = muxConnection.Close()
+		}
+	}()
 
 	pairRecord, err := muxConnection.ReadPair(device.Properties.SerialNumber)
 	if err != nil {
@@ -334,6 +420,7 @@ func ConnectLockdownWithSession(device DeviceEntry) (*LockDownConnection, error)
 	if err != nil {
 		return nil, fmt.Errorf("StartSession failed: %+v error: %v", resp, err)
 	}
+	muxConnection.ReleaseDeviceConnection()
 	return lockdownConnection, nil
 }
 

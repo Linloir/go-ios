@@ -20,6 +20,7 @@ func TestRebootListenAndImage(t *testing.T) {
 		t.Error("Failed connecting usbmux", err)
 		return
 	}
+	defer muxConnection.Close()
 	attachedReceiver, err := muxConnection.Listen()
 	if err != nil {
 		t.Error("Failed issuing Listen command, will retry in 3 seconds", err)

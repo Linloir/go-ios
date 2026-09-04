@@ -1,6 +1,8 @@
 package instruments
 
 import (
+	"fmt"
+
 	"github.com/danielpaulus/go-ios/ios"
 	dtx "github.com/danielpaulus/go-ios/ios/dtx_codec"
 )
@@ -25,11 +27,11 @@ func (d *LocationSimulationService) StartSimulateLocation(lat, lon float64) erro
 
 // StopSimulateLocation clears simulated location
 func (d *LocationSimulationService) StopSimulateLocation() error {
+	defer d.Close()
 	_, err := d.channel.MethodCall("stopLocationSimulation")
 	if err != nil {
 		return err
 	}
-	defer d.Close()
 
 	return nil
 }
@@ -40,7 +42,11 @@ func NewLocationSimulationService(device ios.DeviceEntry) (*LocationSimulationSe
 	if err != nil {
 		return nil, err
 	}
-	processControlChannel := dtxConn.RequestChannelIdentifier(locationSimulationIdentifier, loggingDispatcher{dtxConn})
+	processControlChannel, err := dtxConn.RequestChannelIdentifierWithError(locationSimulationIdentifier, loggingDispatcher{dtxConn})
+	if err != nil {
+		_ = dtxConn.Close()
+		return nil, fmt.Errorf("request location simulation channel: %w", err)
+	}
 	return &LocationSimulationService{channel: processControlChannel, conn: dtxConn}, nil
 }
 

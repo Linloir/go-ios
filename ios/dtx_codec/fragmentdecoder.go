@@ -1,7 +1,14 @@
 package dtx
 
 import (
+	"bytes"
 	"encoding/binary"
+	"time"
+)
+
+const (
+	maxDTXFragmentCount         = 4096
+	maxDTXFragmentedMessageSize = 128 << 20
 )
 
 // FragmentDecoder collects DtxMessage fragments and merges them into a single DtxMessage when they are complete.
@@ -18,7 +25,11 @@ import (
 type FragmentDecoder struct {
 	firstFragment Message
 	fragments     []Message
+	received      []bool
+	receivedCount int
+	receivedBytes int
 	finished      bool
+	lastUpdated   time.Time
 }
 
 // NewFragmentDecoder creates a new decoder with the first fragment
@@ -26,7 +37,18 @@ func NewFragmentDecoder(firstFragment Message) *FragmentDecoder {
 	if !firstFragment.IsFirstFragment() {
 		panic("Illegalstate, need to pass in a firstFragment")
 	}
-	return &FragmentDecoder{firstFragment, make([]Message, firstFragment.Fragments-1), false}
+	if firstFragment.Fragments > maxDTXFragmentCount ||
+		firstFragment.MessageLength < int(DtxMessagePayloadHeaderLength) ||
+		firstFragment.MessageLength > maxDTXFragmentedMessageSize {
+		return nil
+	}
+	fragmentSlots := int(firstFragment.Fragments - 1)
+	return &FragmentDecoder{
+		firstFragment: firstFragment,
+		fragments:     make([]Message, fragmentSlots),
+		received:      make([]bool, fragmentSlots),
+		lastUpdated:   time.Now(),
+	}
 }
 
 // AddFragment adds fragments if they match the firstFragment this FragmentDecoder was created with.
@@ -35,11 +57,35 @@ func (f *FragmentDecoder) AddFragment(fragment Message) bool {
 	if !f.firstFragment.MessageIsFirstFragmentFor(fragment) {
 		return false
 	}
-	f.fragments[fragment.FragmentIndex-1] = fragment
-	if fragment.IsLastFragment() {
+	index := int(fragment.FragmentIndex) - 1
+	if index < 0 || index >= len(f.fragments) {
+		return false
+	}
+	if fragment.MessageLength < 0 || fragment.MessageLength != len(fragment.fragmentBytes) {
+		return false
+	}
+	if f.received[index] {
+		return bytes.Equal(f.fragments[index].fragmentBytes, fragment.fragmentBytes)
+	}
+	if f.receivedBytes > f.firstFragment.MessageLength-len(fragment.fragmentBytes) {
+		return false
+	}
+	f.fragments[index] = fragment
+	f.lastUpdated = time.Now()
+	f.received[index] = true
+	f.receivedCount++
+	f.receivedBytes += len(fragment.fragmentBytes)
+	if f.receivedCount == len(f.fragments) {
+		if f.receivedBytes != f.firstFragment.MessageLength {
+			return false
+		}
 		f.finished = true
 	}
 	return true
+}
+
+func (f *FragmentDecoder) stale(now time.Time, timeout time.Duration) bool {
+	return !f.lastUpdated.IsZero() && now.Sub(f.lastUpdated) > timeout
 }
 
 // HasFinished can be used to check if all fragments have been added

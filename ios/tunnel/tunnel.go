@@ -116,6 +116,7 @@ func ManualPairAndConnectToTunnel(ctx context.Context, device ios.DeviceEntry, p
 		return Tunnel{}, fmt.Errorf("ManualPairAndConnectToTunnel: failed to create RemoteXPC connection: %w", err)
 	}
 	ts := newTunnelServiceWithXpc(xpcConn, h, p)
+	defer ts.Close()
 
 	err = ts.ManualPair()
 	if err != nil {

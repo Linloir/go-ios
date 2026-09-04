@@ -9,6 +9,7 @@ import (
 	"maps"
 	"path"
 	"strings"
+	"sync"
 
 	"github.com/Masterminds/semver"
 	"github.com/danielpaulus/go-ios/ios/afc"
@@ -177,11 +178,14 @@ type dtxproxy struct {
 	proxyDispatcher  proxyDispatcher
 }
 
-func newDtxProxy(dtxConnection *dtx.Connection) dtxproxy {
+func newDtxProxy(dtxConnection *dtx.Connection) (dtxproxy, error) {
 	testBundleReadyChannel := make(chan dtx.Message, 1)
 	//(xide XCTestManager_IDEInterface)
 	proxyDispatcher := proxyDispatcher{testBundleReadyChannel: testBundleReadyChannel, dtxConnection: dtxConnection}
-	IDEDaemonProxy := dtxConnection.RequestChannelIdentifier(ideToDaemonProxyChannelName, proxyDispatcher)
+	IDEDaemonProxy, err := dtxConnection.RequestChannelIdentifierWithError(ideToDaemonProxyChannelName, proxyDispatcher)
+	if err != nil {
+		return dtxproxy{}, fmt.Errorf("request XCTestManager daemon proxy channel: %w", err)
+	}
 	ideInterface := XCTestManager_IDEInterface{IDEDaemonProxy: IDEDaemonProxy, testBundleReadyChannel: testBundleReadyChannel}
 
 	return dtxproxy{
@@ -190,10 +194,10 @@ func newDtxProxy(dtxConnection *dtx.Connection) dtxproxy {
 		daemonConnection: XCTestManager_DaemonConnectionInterface{IDEDaemonProxy},
 		dtxConnection:    dtxConnection,
 		proxyDispatcher:  proxyDispatcher,
-	}
+	}, nil
 }
 
-func newDtxProxyWithConfig(dtxConnection *dtx.Connection, testConfig nskeyedarchiver.XCTestConfiguration, testListener *TestListener) dtxproxy {
+func newDtxProxyWithConfig(dtxConnection *dtx.Connection, testConfig nskeyedarchiver.XCTestConfiguration, testListener *TestListener) (dtxproxy, error) {
 	testBundleReadyChannel := make(chan dtx.Message, 1)
 	//(xide XCTestManager_IDEInterface)
 	proxyDispatcher := proxyDispatcher{
@@ -202,7 +206,10 @@ func newDtxProxyWithConfig(dtxConnection *dtx.Connection, testConfig nskeyedarch
 		testRunnerReadyWithCapabilities: testRunnerReadyWithCapabilitiesConfig(testConfig),
 		testListener:                    testListener,
 	}
-	IDEDaemonProxy := dtxConnection.RequestChannelIdentifier(ideToDaemonProxyChannelName, proxyDispatcher)
+	IDEDaemonProxy, err := dtxConnection.RequestChannelIdentifierWithError(ideToDaemonProxyChannelName, proxyDispatcher)
+	if err != nil {
+		return dtxproxy{}, fmt.Errorf("request XCTestManager daemon proxy channel: %w", err)
+	}
 	ideInterface := XCTestManager_IDEInterface{IDEDaemonProxy: IDEDaemonProxy, testConfig: testConfig, testBundleReadyChannel: testBundleReadyChannel}
 
 	return dtxproxy{
@@ -211,7 +218,7 @@ func newDtxProxyWithConfig(dtxConnection *dtx.Connection, testConfig nskeyedarch
 		daemonConnection: XCTestManager_DaemonConnectionInterface{IDEDaemonProxy},
 		dtxConnection:    dtxConnection,
 		proxyDispatcher:  proxyDispatcher,
-	}
+	}, nil
 }
 
 const (
@@ -251,6 +258,9 @@ type TestConfig struct {
 }
 
 func StartXCTestWithConfig(ctx context.Context, xctestrunFilePath string, device ios.DeviceEntry, listener *TestListener) ([]TestSuite, error) {
+	if listener == nil {
+		return nil, errors.New("StartXCTestWithConfig: listener cannot be nil")
+	}
 	xctestConfigurations, err := parseFile(xctestrunFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing xctestrun file: %w", err)
@@ -267,11 +277,20 @@ func StartXCTestWithConfig(ctx context.Context, xctestrunFilePath string, device
 		}
 	}
 
+	return runXCTestTargets(ctx, xcTestTargets, listener, RunTestWithConfig)
+}
+
+type testTargetRunner func(context.Context, TestConfig) ([]TestSuite, error)
+
+func runXCTestTargets(ctx context.Context, targets []TestConfig, listener *TestListener, run testTargetRunner) ([]TestSuite, error) {
 	var results []TestSuite
 	var targetErrors []error
-	for _, target := range xcTestTargets {
-		listener.reset()
-		suites, err := RunTestWithConfig(ctx, target)
+	for _, target := range targets {
+		// A closed DTX transport wakes its reader, but Close does not join that
+		// goroutine. Give every target independent state so any already-decoded
+		// callback from the previous target cannot close or mutate this run.
+		target.Listener = listener.newTargetListener()
+		suites, err := run(ctx, target)
 		if err != nil {
 			targetErrors = append(targetErrors, err)
 		}
@@ -351,7 +370,10 @@ func runXUITestWithBundleIdsXcode15Ctx(
 
 	testSessionID := uuid.New()
 	testconfig := createTestConfig(info, testSessionID, config.XctestConfigName, config.TestsToRun, config.TestsToSkip, config.XcTest, version)
-	ideDaemonProxy1 := newDtxProxyWithConfig(conn1, testconfig, config.Listener)
+	ideDaemonProxy1, err := newDtxProxyWithConfig(conn1, testconfig, config.Listener)
+	if err != nil {
+		return make([]TestSuite, 0), fmt.Errorf("runXUITestWithBundleIdsXcode15Ctx: cannot create IDE daemon proxy: %w", err)
+	}
 
 	localCaps := nskeyedarchiver.XCTCapabilities{CapabilitiesDictionary: map[string]interface{}{
 		"XCTIssue capability":                      uint64(1),
@@ -382,15 +404,17 @@ func runXUITestWithBundleIdsXcode15Ctx(
 		return make([]TestSuite, 0), fmt.Errorf("runXUITestWithBundleIdsXcode15Ctx: cannot start test runner: %w", err)
 	}
 
-	defer testRunnerLaunch.Close()
-	go func() {
-		_, err := io.Copy(config.Listener.logWriter, testRunnerLaunch)
-		if err != nil {
-			log.Warn("copying stdout failed", log.WithError(err))
-		}
-	}()
+	stopStdoutCopy := startTestRunnerOutputCopy(config.Listener, testRunnerLaunch)
+	defer stopStdoutCopy()
+	cleanupTestRunner := newTestRunnerCleanup(uint64(testRunnerLaunch.Pid), func() error {
+		return appserviceConn.KillProcess(testRunnerLaunch.Pid)
+	})
+	defer cleanupTestRunner()
 
-	ideDaemonProxy2 := newDtxProxyWithConfig(conn2, testconfig, config.Listener)
+	ideDaemonProxy2, err := newDtxProxyWithConfig(conn2, testconfig, config.Listener)
+	if err != nil {
+		return make([]TestSuite, 0), fmt.Errorf("runXUITestWithBundleIdsXcode15Ctx: cannot create control daemon proxy: %w", err)
+	}
 	caps, err := ideDaemonProxy2.daemonConnection.initiateControlSessionWithCapabilities(nskeyedarchiver.XCTCapabilities{CapabilitiesDictionary: map[string]interface{}{}})
 	if err != nil {
 		return make([]TestSuite, 0), fmt.Errorf("runXUITestWithBundleIdsXcode15Ctx: cannot initiate a control session with capabilities: %w", err)
@@ -402,7 +426,12 @@ func runXUITestWithBundleIdsXcode15Ctx(
 	}
 	log.WithField("authorized", authorized).Info("authorized")
 
-	ideInterfaceChannel := ideDaemonProxy1.dtxConnection.ForChannelRequest(proxyDispatcher{id: "dtxproxy:XCTestDriverInterface:XCTestManager_IDEInterface"})
+	interfaceDispatcher := ideDaemonProxy1.proxyDispatcher
+	interfaceDispatcher.id = "dtxproxy:XCTestDriverInterface:XCTestManager_IDEInterface"
+	ideInterfaceChannel, err := ideDaemonProxy1.dtxConnection.ForChannelRequestContext(ctx, interfaceDispatcher)
+	if err != nil {
+		return make([]TestSuite, 0), fmt.Errorf("runXUITestWithBundleIdsXcode15Ctx: waiting for test runner channel: %w", err)
+	}
 
 	proto := uint64(36)
 	err = ideDaemonProxy1.daemonConnection.startExecutingTestPlanWithProtocolVersion(ideInterfaceChannel, proto)
@@ -430,32 +459,45 @@ func runXUITestWithBundleIdsXcode15Ctx(
 	case <-ctx.Done():
 		break
 	}
-	log.Infof("Killing test runner with pid %d ...", testRunnerLaunch.Pid)
-	err = killTestRunner(appserviceConn, testRunnerLaunch.Pid)
-	if err != nil {
-		log.Infof("Nothing to kill, process with pid %d is already dead", testRunnerLaunch.Pid)
-	} else {
-		log.Info("Test runner killed with success")
-	}
+	cleanupTestRunner()
 
 	log.Debugf("Done running test")
 
-	return config.Listener.TestSuites, config.Listener.err
+	return config.Listener.Result()
 }
 
-type processKiller interface {
-	KillProcess(pid int) error
-}
+func startTestRunnerOutputCopy(dst io.Writer, src io.ReadCloser) func() {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := io.Copy(dst, src); err != nil {
+			log.WithError(err).Warn("copying stdout failed")
+		}
+	}()
 
-func killTestRunner(killer processKiller, pid int) error {
-	log.Infof("Killing test runner with pid %d ...", pid)
-	err := killer.KillProcess(pid)
-	if err != nil {
-		return err
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if err := src.Close(); err != nil {
+				log.WithError(err).Warn("closing test runner stdout failed")
+			}
+			<-done
+		})
 	}
-	log.Info("Test runner killed with success")
+}
 
-	return nil
+func newTestRunnerCleanup(pid uint64, kill func() error) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			log.Infof("Killing test runner with pid %d ...", pid)
+			if err := kill(); err != nil {
+				log.Infof("Nothing to kill, process with pid %d is already dead: %v", pid, err)
+				return
+			}
+			log.Info("Test runner killed with success")
+		})
+	}
 }
 
 func startTestRunner17(appserviceConn *appservice.Connection, bundleID string, sessionIdentifier string, testBundlePath string, testArgs []string, testEnv map[string]interface{}, isXCTest bool) (appservice.LaunchedAppWithStdIo, error) {

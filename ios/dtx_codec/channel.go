@@ -23,6 +23,13 @@ type Channel struct {
 	timeout           time.Duration
 }
 
+const (
+	fragmentAssemblyTTL                   = time.Minute
+	maxDTXFragmentAssembliesPerChannel    = 128
+	maxDTXFragmentCacheBytesPerChannel    = 256 << 20
+	fragmentAssemblyMetadataBytesPerPiece = 256
+)
+
 // ChannelOption for configuring settings on dtx.Channels
 type ChannelOption func(*Channel)
 
@@ -37,26 +44,42 @@ func WithTimeout(seconds uint32) ChannelOption {
 func (d *Channel) RegisterMethodForRemote(selector string) {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
-	d.registeredMethods[selector] = make(chan Message)
+	if d.registeredMethods == nil {
+		d.registeredMethods = make(map[string]chan Message)
+	}
+	d.registeredMethods[selector] = make(chan Message, 8)
 }
 
 func (d *Channel) ReceiveMethodCall(selector string) Message {
 	d.mutex.Lock()
 	channel := d.registeredMethods[selector]
 	d.mutex.Unlock()
-	return <-channel
+	select {
+	case msg := <-channel:
+		return msg
+	case <-d.connection.Closed():
+		return Message{}
+	}
 }
 
 func (d *Channel) ReceiveMethodCallWithTimeout(ctx context.Context, selector string) (Message, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	d.mutex.Lock()
 	channel := d.registeredMethods[selector]
 	d.mutex.Unlock()
 	select {
 	case msg := <-channel:
 		return msg, nil
-	// context is cancelled because the timeout is exceeded
 	case <-ctx.Done():
 		return Message{}, ctx.Err()
+	case <-d.connection.Closed():
+		err := d.connection.Err()
+		if err == nil {
+			err = ErrConnectionClosed
+		}
+		return Message{}, err
 	}
 }
 
@@ -72,6 +95,9 @@ func (d *Channel) MethodCall(selector string, args ...interface{}) (Message, err
 // MethodCallWithContext is like MethodCall but respects the provided context for cancellation/timeout.
 // If the context has no deadline, the channel's default timeout is applied.
 func (d *Channel) MethodCallWithContext(ctx context.Context, selector string, args ...interface{}) (Message, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, d.timeout)
@@ -102,7 +128,7 @@ func (d *Channel) methodCallWithReply(ctx context.Context, selector string, auxi
 		return msg, err
 	}
 	if msg.HasError() {
-		return msg, fmt.Errorf("failed invoking method '%s' with error: %s", selector, msg.Payload[0])
+		return msg, fmt.Errorf("failed invoking method '%s' with error: %v", selector, msg.Payload)
 	}
 	return msg, nil
 }
@@ -141,7 +167,38 @@ func (d *Channel) AddResponseWaiter(identifier int, channel chan Message) {
 	d.responseWaiters[identifier] = channel
 }
 
+func (d *Channel) removeResponseWaiter(identifier int) {
+	d.mutex.Lock()
+	delete(d.responseWaiters, identifier)
+	delete(d.defragmenters, identifier)
+	d.mutex.Unlock()
+}
+
+func (d *Channel) takeResponseWaiter(identifier int) chan Message {
+	d.mutex.Lock()
+	channel := d.responseWaiters[identifier]
+	delete(d.responseWaiters, identifier)
+	d.mutex.Unlock()
+	return channel
+}
+
 func (d *Channel) sendAndAwaitReply(ctx context.Context, expectsReply bool, messageType MessageType, payloadBytes []byte, auxiliary PrimitiveDictionary) (Message, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return Message{}, err
+	}
+	select {
+	case <-d.connection.Closed():
+		err := d.connection.Err()
+		if err == nil {
+			err = ErrConnectionClosed
+		}
+		return Message{}, err
+	default:
+	}
+
 	d.mutex.Lock()
 	identifier := d.messageIdentifier
 	d.messageIdentifier++
@@ -150,8 +207,23 @@ func (d *Channel) sendAndAwaitReply(ctx context.Context, expectsReply bool, mess
 	if err != nil {
 		return Message{}, err
 	}
-	responseChannel := make(chan Message)
+	// Buffer the single response so a response racing context cancellation can
+	// never block the DTX reader after the caller has returned.
+	responseChannel := make(chan Message, 1)
 	d.AddResponseWaiter(identifier, responseChannel)
+	defer d.removeResponseWaiter(identifier)
+	if err := ctx.Err(); err != nil {
+		return Message{}, err
+	}
+	select {
+	case <-d.connection.Closed():
+		err := d.connection.Err()
+		if err == nil {
+			err = ErrConnectionClosed
+		}
+		return Message{}, err
+	default:
+	}
 
 	err = d.connection.Send(bytes)
 	if err != nil {
@@ -161,65 +233,188 @@ func (d *Channel) sendAndAwaitReply(ctx context.Context, expectsReply bool, mess
 	case response := <-responseChannel:
 		return response, nil
 	case <-ctx.Done():
-		return Message{}, fmt.Errorf("Timed out waiting for response for message:%d channel:%d", identifier, d.channelCode)
+		return Message{}, fmt.Errorf("waiting for response for message:%d channel:%d: %w", identifier, d.channelCode, ctx.Err())
+	case <-d.connection.Closed():
+		err := d.connection.Err()
+		if err == nil {
+			err = ErrConnectionClosed
+		}
+		return Message{}, fmt.Errorf("waiting for response for message:%d channel:%d: %w", identifier, d.channelCode, err)
 	}
 }
 
 func (d *Channel) Dispatch(msg Message) {
 	d.mutex.Lock()
+	d.cleanupStaleDefragmentersLocked(time.Now())
 	if msg.Identifier >= d.messageIdentifier {
 		d.messageIdentifier = msg.Identifier + 1
 	}
-	if msg.PayloadHeader.MessageType == Methodinvocation {
-		log.Trace("Dispatching:", msg.Payload[0].(string))
-		if v, ok := d.registeredMethods[msg.Payload[0].(string)]; ok {
+	if msg.PayloadHeader.MessageType == Methodinvocation && len(msg.Payload) > 0 {
+		selector, isSelector := msg.Payload[0].(string)
+		if isSelector {
+			log.Trace("Dispatching:", selector)
+		}
+		if v, ok := d.registeredMethods[selector]; isSelector && ok {
 			d.mutex.Unlock()
-			v <- msg
+			SendAckIfNeeded(d.connection, msg)
+			select {
+			case v <- msg:
+				return
+			case <-d.connection.Closed():
+				return
+			default:
+			}
+			// Remote accessibility callbacks must never block the sole reader.
+			// Preserve a bounded recent queue and discard the oldest callback if
+			// the consumer is temporarily slower than the device.
+			select {
+			case <-v:
+			default:
+			}
+			select {
+			case v <- msg:
+			case <-d.connection.Closed():
+			default:
+			}
 			return
 		}
 	}
 	d.mutex.Unlock()
 	if msg.ConversationIndex > 0 || msg.IsFragment() {
-		d.mutex.Lock()
-		defer d.mutex.Unlock()
-		if msg.IsFirstFragment() {
-			d.defragmenters[msg.Identifier] = NewFragmentDecoder(msg)
-			SendAckIfNeeded(d.connection, msg)
-			return
-		}
-		if msg.IsFragment() {
-			if defragmenter, ok := d.defragmenters[msg.Identifier]; ok {
-				defragmenter.AddFragment(msg)
-				if msg.IsLastFragment() {
-					messagesBytes := defragmenter.Extract()
-					msg, leftover, err := DecodeNonBlocking(messagesBytes)
-					if len(leftover) != 0 {
-						log.Error("Decoding fragmented message failed")
-					}
-					if err != nil {
-						log.Error("Decoding fragment")
-					}
-
-					if msg.ConversationIndex > 0 {
-						d.responseWaiters[msg.Identifier] <- msg
-					} else {
-						d.messageDispatcher.Dispatch(msg)
-					}
-					delete(d.responseWaiters, msg.Identifier)
-					delete(d.defragmenters, msg.Identifier)
-				}
-				return
-			}
-			log.Warn("Received message fragment without first message, dropping it")
-			delete(d.responseWaiters, msg.Identifier)
-			delete(d.defragmenters, msg.Identifier)
-			return
-		}
-
-		d.responseWaiters[msg.Identifier] <- msg
-		delete(d.responseWaiters, msg.Identifier)
-		delete(d.defragmenters, msg.Identifier)
+		d.dispatchResponseOrFragment(msg)
 		return
 	}
-	d.messageDispatcher.Dispatch(msg)
+	if d.messageDispatcher != nil {
+		d.messageDispatcher.Dispatch(msg)
+	}
+}
+
+func (d *Channel) dispatchResponseOrFragment(msg Message) {
+	if msg.IsFirstFragment() {
+		d.mutex.Lock()
+		if msg.ConversationIndex > 0 {
+			if _, waiting := d.responseWaiters[msg.Identifier]; !waiting {
+				d.mutex.Unlock()
+				SendAckIfNeeded(d.connection, msg)
+				log.WithFields(log.Fields{
+					"channel_id": d.channelName,
+					"message_id": msg.Identifier,
+				}).Debug("dropping late fragmented DTX response without a waiter")
+				return
+			}
+		}
+		if d.defragmenters == nil {
+			d.defragmenters = make(map[int]*FragmentDecoder)
+		}
+		decoder := NewFragmentDecoder(msg)
+		if decoder == nil {
+			d.mutex.Unlock()
+			SendAckIfNeeded(d.connection, msg)
+			log.WithFields(log.Fields{
+				"channel_id": d.channelName,
+				"message_id": msg.Identifier,
+			}).Warn("dropping invalid or oversized DTX fragment assembly")
+			return
+		}
+		if !d.canStoreDefragmenterLocked(msg.Identifier, decoder) {
+			d.mutex.Unlock()
+			SendAckIfNeeded(d.connection, msg)
+			log.WithFields(log.Fields{
+				"channel_id": d.channelName,
+				"message_id": msg.Identifier,
+			}).Warn("dropping DTX fragment assembly because the channel cache is full")
+			return
+		}
+		d.defragmenters[msg.Identifier] = decoder
+		d.mutex.Unlock()
+		SendAckIfNeeded(d.connection, msg)
+		return
+	}
+
+	if msg.IsFragment() {
+		d.mutex.Lock()
+		defragmenter, ok := d.defragmenters[msg.Identifier]
+		if !ok {
+			d.mutex.Unlock()
+			log.Warn("Received message fragment without first message, dropping it")
+			return
+		}
+		if !defragmenter.AddFragment(msg) {
+			delete(d.defragmenters, msg.Identifier)
+			d.mutex.Unlock()
+			log.WithFields(log.Fields{
+				"channel_id": d.channelName,
+				"message_id": msg.Identifier,
+			}).Warn("dropping invalid DTX fragment sequence")
+			return
+		}
+		if !defragmenter.HasFinished() {
+			d.mutex.Unlock()
+			return
+		}
+		messageBytes := defragmenter.Extract()
+		delete(d.defragmenters, msg.Identifier)
+		d.mutex.Unlock()
+
+		decoded, leftover, err := DecodeNonBlocking(messageBytes)
+		if err != nil {
+			log.WithError(err).Error("decoding fragmented DTX message")
+			return
+		}
+		if len(leftover) != 0 {
+			log.Error("decoding fragmented DTX message left trailing bytes")
+		}
+		if decoded.ConversationIndex > 0 {
+			d.deliverResponse(decoded)
+		} else if d.messageDispatcher != nil {
+			d.messageDispatcher.Dispatch(decoded)
+		}
+		return
+	}
+
+	d.deliverResponse(msg)
+}
+
+func (d *Channel) cleanupStaleDefragmentersLocked(now time.Time) {
+	for identifier, decoder := range d.defragmenters {
+		if decoder.firstFragment.ConversationIndex == 0 && decoder.stale(now, fragmentAssemblyTTL) {
+			delete(d.defragmenters, identifier)
+		}
+	}
+}
+
+func (d *Channel) canStoreDefragmenterLocked(identifier int, candidate *FragmentDecoder) bool {
+	count := 1
+	bytes := fragmentAssemblyCost(candidate)
+	for existingIdentifier, decoder := range d.defragmenters {
+		if existingIdentifier == identifier {
+			continue
+		}
+		count++
+		bytes += fragmentAssemblyCost(decoder)
+		if count > maxDTXFragmentAssembliesPerChannel || bytes > maxDTXFragmentCacheBytesPerChannel {
+			return false
+		}
+	}
+	return count <= maxDTXFragmentAssembliesPerChannel && bytes <= maxDTXFragmentCacheBytesPerChannel
+}
+
+func fragmentAssemblyCost(decoder *FragmentDecoder) int64 {
+	return int64(decoder.firstFragment.MessageLength) +
+		int64(decoder.firstFragment.Fragments)*fragmentAssemblyMetadataBytesPerPiece
+}
+
+func (d *Channel) deliverResponse(msg Message) {
+	waiter := d.takeResponseWaiter(msg.Identifier)
+	if waiter == nil {
+		log.WithFields(log.Fields{
+			"channel_id": d.channelName,
+			"message_id": msg.Identifier,
+		}).Debug("dropping late DTX response without a waiter")
+		return
+	}
+	select {
+	case waiter <- msg:
+	case <-d.connection.Closed():
+	}
 }

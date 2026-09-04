@@ -30,7 +30,11 @@ func NewScreenshotService(device ios.DeviceEntry) (*ScreenshotService, error) {
 	if err != nil {
 		return nil, err
 	}
-	processControlChannel := dtxConn.RequestChannelIdentifier(screenshotServiceName, loggingDispatcher{dtxConn})
+	processControlChannel, err := dtxConn.RequestChannelIdentifierWithError(screenshotServiceName, loggingDispatcher{dtxConn})
+	if err != nil {
+		_ = dtxConn.Close()
+		return nil, fmt.Errorf("request screenshot channel: %w", err)
+	}
 	return &ScreenshotService{channel: processControlChannel, conn: dtxConn}, nil
 }
 

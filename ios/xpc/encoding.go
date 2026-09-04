@@ -15,6 +15,13 @@ import (
 
 const bodyVersion = uint32(0x00000005)
 
+// RemoteXPC control messages are expected to be small; bulk file contents use
+// the file-transfer protocol instead. Keep a generous bound so a corrupt or
+// malicious BodyLen cannot trigger an unbounded allocation.
+const maxXPCBodyLength = uint64(64 << 20)
+
+const xpcBodyHeaderLength = uint64(8)
+
 const (
 	wrapperMagic = uint32(0x29b00b92)
 	objectMagic  = uint32(0x42133742)
@@ -86,6 +93,21 @@ func DecodeMessage(r io.Reader) (Message, error) {
 
 // EncodeMessage creates a RemoteXPC message encoded with the body and flags provided
 func EncodeMessage(w io.Writer, message Message) error {
+	encoded, err := encodeMessage(message)
+	if err != nil {
+		return err
+	}
+	if err := writeAll(w, encoded); err != nil {
+		return fmt.Errorf("EncodeMessage: failed to flush message: %w", err)
+	}
+	return nil
+}
+
+// encodeMessage performs all local serialization before any bytes are exposed
+// to the transport. Connection.Send uses this split to avoid consuming a
+// message ID when a body cannot be encoded locally.
+func encodeMessage(message Message) ([]byte, error) {
+	encoded := bytes.NewBuffer(nil)
 	if message.Body == nil {
 		wrapper := struct {
 			magic uint32
@@ -99,16 +121,20 @@ func EncodeMessage(w io.Writer, message Message) error {
 			},
 		}
 
-		err := binary.Write(w, binary.LittleEndian, wrapper)
+		err := binary.Write(encoded, binary.LittleEndian, wrapper)
 		if err != nil {
-			return fmt.Errorf("EncodeMessage: failed to write empty message: %w", err)
+			return nil, fmt.Errorf("EncodeMessage: failed to encode empty message: %w", err)
 		}
-		return nil
+		return encoded.Bytes(), nil
 	}
-	buf := bytes.NewBuffer(nil)
-	err := encodeDictionary(buf, message.Body)
+	body := bytes.NewBuffer(nil)
+	err := encodeDictionary(body, message.Body)
 	if err != nil {
-		return fmt.Errorf("EncodeMessage: failed to encode dictionary: %w", err)
+		return nil, fmt.Errorf("EncodeMessage: failed to encode dictionary: %w", err)
+	}
+	bodyLength := uint64(body.Len()) + xpcBodyHeaderLength
+	if bodyLength > maxXPCBodyLength {
+		return nil, fmt.Errorf("EncodeMessage: body length %d exceeds limit %d", bodyLength, maxXPCBodyLength)
 	}
 
 	wrapper := struct {
@@ -122,7 +148,7 @@ func EncodeMessage(w io.Writer, message Message) error {
 		magic: wrapperMagic,
 		h: wrapperHeader{
 			Flags:   message.Flags,
-			BodyLen: uint64(buf.Len() + 8),
+			BodyLen: bodyLength,
 			MsgId:   message.Id,
 		},
 		body: struct {
@@ -134,17 +160,32 @@ func EncodeMessage(w io.Writer, message Message) error {
 		},
 	}
 
-	err = binary.Write(w, binary.LittleEndian, wrapper)
+	err = binary.Write(encoded, binary.LittleEndian, wrapper)
 	if err != nil {
-		return fmt.Errorf("EncodeMessage: failed to write xpc wrapper: %w", err)
+		return nil, fmt.Errorf("EncodeMessage: failed to encode xpc wrapper: %w", err)
 	}
 
-	_, err = io.Copy(w, buf)
-	if err != nil {
-		return fmt.Errorf("EncodeMessage: failed to write message body: %w", err)
+	if _, err = encoded.Write(body.Bytes()); err != nil {
+		return nil, fmt.Errorf("EncodeMessage: failed to buffer message body: %w", err)
+	}
+	return encoded.Bytes(), nil
+}
+
+func writeAll(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if n < 0 || n > len(p) {
+			return fmt.Errorf("invalid write count %d for %d bytes", n, len(p))
+		}
+		p = p[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
 	}
 	return nil
-
 }
 
 func decodeWrapper(r io.Reader) (Message, error) {
@@ -156,7 +197,14 @@ func decodeWrapper(r io.Reader) (Message, error) {
 	if h.BodyLen == 0 {
 		return Message{
 			Flags: h.Flags,
+			Id:    h.MsgId,
 		}, nil
+	}
+	if h.BodyLen < xpcBodyHeaderLength {
+		return Message{}, fmt.Errorf("decodeWrapper: invalid body length %d, minimum is %d", h.BodyLen, xpcBodyHeaderLength)
+	}
+	if h.BodyLen > maxXPCBodyLength {
+		return Message{}, fmt.Errorf("decodeWrapper: body length %d exceeds limit %d", h.BodyLen, maxXPCBodyLength)
 	}
 	body, err := decodeBody(r, h)
 	if err != nil {
@@ -165,6 +213,7 @@ func decodeWrapper(r io.Reader) (Message, error) {
 	return Message{
 		Flags: h.Flags,
 		Body:  body,
+		Id:    h.MsgId,
 	}, nil
 }
 
@@ -182,21 +231,42 @@ func decodeBody(r io.Reader, h wrapperHeader) (map[string]interface{}, error) {
 	if bodyHeader.Version != bodyVersion {
 		return nil, fmt.Errorf("decodeBody: expected version 0x%x but got 0x%x", bodyVersion, bodyHeader.Version)
 	}
-	bodyPayloadLength := h.BodyLen - 8
-	body := make([]byte, bodyPayloadLength)
-	n, err := r.Read(body)
+	bodyPayloadLength := h.BodyLen - xpcBodyHeaderLength
+	body, err := readBoundedBytes(r, bodyPayloadLength, maxXPCBodyLength, "decodeBody payload")
 	if err != nil {
-		return nil, fmt.Errorf("decodeBody:: failed to read body data: %w", err)
-	}
-	if uint64(n) != bodyPayloadLength {
-		return nil, fmt.Errorf("decodeBody: could not read full body. only %d instead of %d were read", n, bodyPayloadLength)
+		return nil, fmt.Errorf("decodeBody: failed to read body data: %w", err)
 	}
 	bodyBuf := bytes.NewReader(body)
 	res, err := decodeObject(bodyBuf)
 	if err != nil {
 		return nil, fmt.Errorf("decodeBody: failed to decode body: %w", err)
 	}
-	return res.(map[string]interface{}), nil
+	dict, ok := res.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("decodeBody: expected dictionary root, got %T", res)
+	}
+	if bodyBuf.Len() != 0 {
+		return nil, fmt.Errorf("decodeBody: %d trailing payload bytes", bodyBuf.Len())
+	}
+	return dict, nil
+}
+
+func readBoundedBytes(r io.Reader, length, limit uint64, field string) ([]byte, error) {
+	if length > limit {
+		return nil, fmt.Errorf("%s length %d exceeds limit %d", field, length, limit)
+	}
+	maxInt := uint64(^uint(0) >> 1)
+	if length > maxInt {
+		return nil, fmt.Errorf("%s length %d does not fit in int", field, length)
+	}
+	if remaining, ok := r.(interface{ Len() int }); ok && length > uint64(remaining.Len()) {
+		return nil, fmt.Errorf("%s length %d exceeds remaining %d: %w", field, length, remaining.Len(), io.ErrUnexpectedEOF)
+	}
+	data := make([]byte, int(length))
+	if _, err := io.ReadFull(r, data); err != nil {
+		return nil, fmt.Errorf("read %s: %w", field, err)
+	}
+	return data, nil
 }
 
 func decodeObject(r io.Reader) (interface{}, error) {
@@ -237,7 +307,7 @@ func decodeObject(r io.Reader) (interface{}, error) {
 
 func decodeUuid(r io.Reader) (uuid.UUID, error) {
 	b := make([]byte, 16)
-	_, err := r.Read(b)
+	_, err := io.ReadFull(r, b)
 	if err != nil {
 		return [16]byte{}, fmt.Errorf("decodeUuid: failed to read data: %w", err)
 	}
@@ -276,25 +346,41 @@ func decodeFileTransfer(r io.Reader) (FileTransfer, error) {
 }
 
 func decodeDictionary(r io.Reader) (map[string]interface{}, error) {
-	var l, numEntries uint32
+	var l uint32
 	err := binary.Read(r, binary.LittleEndian, &l)
 	if err != nil {
 		return nil, fmt.Errorf("decodeDictionary: failed to read data: %w", err)
 	}
-	err = binary.Read(r, binary.LittleEndian, &numEntries)
+	if l < 4 {
+		return nil, fmt.Errorf("decodeDictionary: payload length %d is smaller than entry-count header", l)
+	}
+	payload, err := readBoundedBytes(r, uint64(l), maxXPCBodyLength, "dictionary payload")
+	if err != nil {
+		return nil, fmt.Errorf("decodeDictionary: %w", err)
+	}
+	payloadReader := bytes.NewReader(payload)
+	var numEntries uint32
+	err = binary.Read(payloadReader, binary.LittleEndian, &numEntries)
 	if err != nil {
 		return nil, fmt.Errorf("decodeDictionary: failed to read number of entries: %w", err)
 	}
+	// The smallest entry is a padded empty key plus a null value: 8 bytes.
+	if uint64(numEntries) > uint64(payloadReader.Len()/8) {
+		return nil, fmt.Errorf("decodeDictionary: %d entries cannot fit in %d payload bytes", numEntries, payloadReader.Len())
+	}
 	dict := make(map[string]interface{})
 	for i := uint32(0); i < numEntries; i++ {
-		key, err := readDictionaryKey(r)
+		key, err := readDictionaryKey(payloadReader)
 		if err != nil {
 			return nil, fmt.Errorf("decodeDictionary: failed to read dictionary key: %w", err)
 		}
-		dict[key], err = decodeObject(r)
+		dict[key], err = decodeObject(payloadReader)
 		if err != nil {
 			return nil, fmt.Errorf("decodeDictionary: failed to decode object for key '%s': %w", key, err)
 		}
+	}
+	if payloadReader.Len() != 0 {
+		return nil, fmt.Errorf("decodeDictionary: %d trailing payload bytes", payloadReader.Len())
 	}
 	return dict, nil
 }
@@ -330,12 +416,29 @@ func decodeArray(r io.Reader) ([]interface{}, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decodeArray: failed to read number of entries: %w", err)
 	}
-	arr := make([]interface{}, numEntries)
+	if l < 4 {
+		return nil, fmt.Errorf("decodeArray: payload length %d is smaller than entry-count header", l)
+	}
+	// Like dictionaries, the protocol's array payload length includes the
+	// four-byte entry count that was just read.
+	payload, err := readBoundedBytes(r, uint64(l-4), maxXPCBodyLength, "array payload")
+	if err != nil {
+		return nil, fmt.Errorf("decodeArray: %w", err)
+	}
+	// Every encoded object has at least a four-byte type tag.
+	if uint64(numEntries) > uint64(len(payload)/4) {
+		return nil, fmt.Errorf("decodeArray: %d entries cannot fit in %d payload bytes", numEntries, len(payload))
+	}
+	arr := make([]interface{}, int(numEntries))
+	payloadReader := bytes.NewReader(payload)
 	for i := uint32(0); i < numEntries; i++ {
-		arr[i], err = decodeObject(r)
+		arr[i], err = decodeObject(payloadReader)
 		if err != nil {
 			return nil, fmt.Errorf("decodeArray: failed to decode object at index %d: %w", i, err)
 		}
+	}
+	if payloadReader.Len() != 0 {
+		return nil, fmt.Errorf("decodeArray: %d trailing payload bytes", payloadReader.Len())
 	}
 	return arr, nil
 }
@@ -346,8 +449,7 @@ func decodeString(r io.Reader) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("decodeString: failed to read string length: %w", err)
 	}
-	s := make([]byte, l)
-	_, err = r.Read(s)
+	s, err := readBoundedBytes(r, uint64(l), maxXPCBodyLength, "string payload")
 	if err != nil {
 		return "", fmt.Errorf("decodeString: failed to read string: %w", err)
 	}
@@ -366,13 +468,14 @@ func decodeData(r io.Reader) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decodeData: failed to read payload length: %w", err)
 	}
-	b := make([]byte, l)
-	_, err = r.Read(b)
+	b, err := readBoundedBytes(r, uint64(l), maxXPCBodyLength, "data payload")
 	if err != nil {
 		return nil, fmt.Errorf("decodeData: failed to read payload: %w", err)
 	}
 	toSkip := calcPadding(int(l))
-	_, _ = io.CopyN(io.Discard, r, toSkip)
+	if _, err := io.CopyN(io.Discard, r, toSkip); err != nil {
+		return nil, fmt.Errorf("decodeData: failed to skip padding bytes: %w", err)
+	}
 	return b, nil
 }
 
@@ -409,7 +512,9 @@ func decodeBool(r io.Reader) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("decodeBool: failed to read data: %w", err)
 	}
-	_, _ = io.CopyN(io.Discard, r, 3)
+	if _, err := io.CopyN(io.Discard, r, 3); err != nil {
+		return false, fmt.Errorf("decodeBool: failed to skip padding bytes: %w", err)
+	}
 	return b, nil
 }
 
@@ -545,7 +650,7 @@ func encodeArray(w io.Writer, slice []interface{}) error {
 		t          xpcType
 		l          uint32
 		numObjects uint32
-	}{arrayType, uint32(buf.Len()), uint32(len(slice))}
+	}{arrayType, uint32(buf.Len() + 4), uint32(len(slice))}
 	if err := binary.Write(w, binary.LittleEndian, header); err != nil {
 		return fmt.Errorf("encodeArray: failed to write array header: %w", err)
 	}

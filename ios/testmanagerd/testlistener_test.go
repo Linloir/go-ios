@@ -1,7 +1,10 @@
 package testmanagerd
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -372,4 +375,264 @@ func TestTestCaseLookup(t *testing.T) {
 			assert.Greater(t, testCase.Duration.Seconds(), 0.0)
 		}
 	})
+}
+
+func TestResultReturnsDeepSnapshot(t *testing.T) {
+	listener := NewTestListener(io.Discard, io.Discard, t.TempDir())
+	listener.stateMu.Lock()
+	listener.TestSuites = []TestSuite{{
+		Name: "original-suite",
+		TestCases: []TestCase{{
+			MethodName: "original-case",
+			Attachments: []TestAttachment{{
+				Name: "original-attachment",
+			}},
+		}},
+	}}
+	listener.stateMu.Unlock()
+
+	snapshot, err := listener.Result()
+	assert.NoError(t, err)
+	snapshot[0].Name = "mutated-suite"
+	snapshot[0].TestCases[0].MethodName = "mutated-case"
+	snapshot[0].TestCases[0].Attachments[0].Name = "mutated-attachment"
+
+	again, err := listener.Result()
+	assert.NoError(t, err)
+	assert.Equal(t, "original-suite", again[0].Name)
+	assert.Equal(t, "original-case", again[0].TestCases[0].MethodName)
+	assert.Equal(t, "original-attachment", again[0].TestCases[0].Attachments[0].Name)
+}
+
+func TestAttachmentWriteDoesNotHoldListenerStateLock(t *testing.T) {
+	listener := NewTestListener(io.Discard, io.Discard, t.TempDir())
+	listener.testSuiteDidStart("suite", "2024-01-16 15:36:43 +0000")
+	listener.testCaseDidStartForClass("suite", "test")
+
+	writeStarted := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	listener.writeAttachment = func(_ string, _ []byte) error {
+		close(writeStarted)
+		<-releaseWrite
+		return nil
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		listener.testCaseFinished("suite", "test", nskeyedarchiver.XCActivityRecord{
+			Title:        "activity",
+			ActivityType: "type",
+			Attachments: []nskeyedarchiver.XCTAttachment{{
+				Name:    "attachment",
+				Payload: []byte("payload"),
+			}},
+		})
+	}()
+	<-writeStarted
+
+	resultReturned := make(chan struct{})
+	go func() {
+		defer close(resultReturned)
+		_, _ = listener.Result()
+	}()
+	select {
+	case <-resultReturned:
+	case <-time.After(time.Second):
+		close(releaseWrite)
+		<-finished
+		t.Fatal("Result blocked behind attachment filesystem I/O")
+	}
+
+	// Moving the running suite into completed results while the file write is in
+	// progress must not lose or mis-attribute the attachment.
+	listener.testSuiteFinished("suite", "2024-01-16 15:36:44 +0000", 1, 0, 0, 0, 0, 0, 0.01, 0.01)
+	close(releaseWrite)
+	<-finished
+	suites, err := listener.Result()
+	assert.NoError(t, err)
+	if assert.Len(t, suites, 1) && assert.Len(t, suites[0].TestCases, 1) {
+		assert.Len(t, suites[0].TestCases[0].Attachments, 1)
+	}
+}
+
+type blockingReadCloser struct {
+	readStarted chan struct{}
+	closed      chan struct{}
+	startOnce   sync.Once
+	closeOnce   sync.Once
+}
+
+func (r *blockingReadCloser) Read(_ []byte) (int, error) {
+	r.startOnce.Do(func() { close(r.readStarted) })
+	<-r.closed
+	return 0, io.EOF
+}
+
+func (r *blockingReadCloser) Close() error {
+	r.closeOnce.Do(func() { close(r.closed) })
+	return nil
+}
+
+func TestStopTestRunnerOutputCopyClosesAndJoinsReader(t *testing.T) {
+	src := &blockingReadCloser{
+		readStarted: make(chan struct{}),
+		closed:      make(chan struct{}),
+	}
+	stop := startTestRunnerOutputCopy(io.Discard, src)
+	<-src.readStarted
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		stop()
+		stop()
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("stdout cleanup did not close and join the copy goroutine")
+	}
+}
+
+func TestListenerConcurrentDTXEventsAndResultSnapshots(t *testing.T) {
+	var logOutput bytes.Buffer
+	var debugOutput bytes.Buffer
+	listener := NewTestListener(&logOutput, &debugOutput, t.TempDir())
+
+	const eventsPerReader = 100
+	start := make(chan struct{})
+	var writers sync.WaitGroup
+	writers.Add(2)
+	go func() {
+		defer writers.Done()
+		<-start
+		for event := 0; event < eventsPerReader; event++ {
+			suite := fmt.Sprintf("suite-%d", event)
+			method := fmt.Sprintf("event-%d", event)
+			listener.LogMessage("stdout")
+			listener.testSuiteDidStart(suite, "2024-01-16 15:36:43 +0000")
+			listener.testCaseDidStartForClass(suite, method)
+			listener.testCaseDidFinishForTest(suite, method, "passed", 0.01)
+			listener.testSuiteFinished(suite, "2024-01-16 15:36:44 +0000", 1, 0, 0, 0, 0, 0, 0.01, 0.01)
+		}
+	}()
+	go func() {
+		defer writers.Done()
+		<-start
+		for event := 0; event < eventsPerReader; event++ {
+			listener.setError(fmt.Errorf("reader error %d", event))
+			listener.LogMessage("log")
+			listener.LogDebugMessage("debug")
+		}
+	}()
+
+	snapshotsDone := make(chan struct{})
+	go func() {
+		defer close(snapshotsDone)
+		<-start
+		for snapshot := 0; snapshot < eventsPerReader; snapshot++ {
+			suites, _ := listener.Result()
+			if len(suites) > 0 {
+				suites[0].Name = "detached"
+			}
+		}
+	}()
+
+	close(start)
+	writers.Wait()
+	<-snapshotsDone
+
+	suites, err := listener.Result()
+	assert.Error(t, err)
+	assert.Len(t, suites, eventsPerReader)
+}
+
+func TestConcurrentFinishSignalsDoneOnce(t *testing.T) {
+	listener := NewTestListener(io.Discard, io.Discard, t.TempDir())
+	listener.testSuiteDidStart("suite", "2024-01-16 15:36:43 +0000")
+
+	var finishers sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		finishers.Add(1)
+		go func(index int) {
+			defer finishers.Done()
+			if index%2 == 0 {
+				listener.FinishWithError(fmt.Errorf("failure %d", index))
+				return
+			}
+			listener.didFinishExecutingTestPlan()
+		}(i)
+	}
+	finishers.Wait()
+
+	select {
+	case <-listener.Done():
+	case <-time.After(time.Second):
+		t.Fatal("listener was not marked done")
+	}
+	_, err := listener.Result()
+	assert.Error(t, err)
+}
+
+func TestRunXCTestTargetsIsolatesLateCallbacksAndSharesWriterLock(t *testing.T) {
+	var output bytes.Buffer
+	listener := NewTestListener(&output, &output, t.TempDir())
+
+	oldTargetReleased := make(chan struct{})
+	oldTargetReady := make(chan struct{})
+	startWrites := make(chan struct{})
+	oldTargetDone := make(chan struct{})
+	var targetListeners []*TestListener
+	secondTargetWasFinishedByOldCallback := false
+	call := 0
+	run := func(_ context.Context, config TestConfig) ([]TestSuite, error) {
+		call++
+		targetListeners = append(targetListeners, config.Listener)
+		if call == 1 {
+			config.Listener.testSuiteDidStart("first", "2024-01-16 15:36:43 +0000")
+			config.Listener.testSuiteFinished("first", "2024-01-16 15:36:44 +0000", 1, 0, 0, 0, 0, 0, 0.01, 0.01)
+			go func(oldListener *TestListener) {
+				defer close(oldTargetDone)
+				<-oldTargetReleased
+				oldListener.didFinishExecutingTestPlan()
+				close(oldTargetReady)
+				<-startWrites
+				for i := 0; i < 10_000; i++ {
+					oldListener.LogMessage("old")
+				}
+				oldListener.testSuiteDidStart("late-old", "2024-01-16 15:36:45 +0000")
+				oldListener.testSuiteFinished("late-old", "2024-01-16 15:36:46 +0000", 1, 0, 0, 0, 0, 0, 0.01, 0.01)
+			}(config.Listener)
+			return config.Listener.Result()
+		}
+
+		close(oldTargetReleased)
+		<-oldTargetReady
+		close(startWrites)
+		for i := 0; i < 10_000; i++ {
+			config.Listener.LogDebugMessage("new")
+		}
+		<-oldTargetDone
+		select {
+		case <-config.Listener.Done():
+			secondTargetWasFinishedByOldCallback = true
+		default:
+		}
+		config.Listener.testSuiteDidStart("second", "2024-01-16 15:36:47 +0000")
+		config.Listener.testSuiteFinished("second", "2024-01-16 15:36:48 +0000", 1, 0, 0, 0, 0, 0, 0.01, 0.01)
+		return config.Listener.Result()
+	}
+
+	results, err := runXCTestTargets(context.Background(), []TestConfig{{}, {}}, listener, run)
+	assert.NoError(t, err)
+	assert.Len(t, targetListeners, 2)
+	assert.NotSame(t, listener, targetListeners[0])
+	assert.NotSame(t, listener, targetListeners[1])
+	assert.NotSame(t, targetListeners[0], targetListeners[1])
+	assert.Same(t, targetListeners[0].outputWriterMutex(), targetListeners[1].outputWriterMutex())
+	assert.False(t, secondTargetWasFinishedByOldCallback)
+	if assert.Len(t, results, 2) {
+		assert.Equal(t, "first", results[0].Name)
+		assert.Equal(t, "second", results[1].Name)
+	}
 }

@@ -1,6 +1,7 @@
 package testmanagerd
 
 import (
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"strings"
@@ -13,24 +14,43 @@ import (
 type proxyDispatcher struct {
 	testBundleReadyChannel          chan dtx.Message
 	testRunnerReadyWithCapabilities dtx.MethodWithResponse
-	dtxConnection                   *dtx.Connection
+	dtxConnection                   proxyDTXConnection
 	id                              string
 	testListener                    *TestListener
 }
 
+type proxyDTXConnection interface {
+	Send([]byte) error
+	Close() error
+	Closed() <-chan struct{}
+}
+
 func (p proxyDispatcher) Dispatch(m dtx.Message) {
-	var dispatcher = &p
+	shouldAck := true
 	defer func() {
 		if r := recover(); r != nil {
 			stacktrace := string(debug.Stack())
-			dispatcher.testListener.err = fmt.Errorf("Dispatch: %s\n%s", r, stacktrace)
+			err := fmt.Errorf("Dispatch: %v\n%s", r, stacktrace)
+			if shouldAck {
+				p.recordError(err)
+			} else {
+				p.terminate(err)
+			}
+		}
+		if shouldAck {
+			if err := p.sendAckIfNeeded(m); err != nil {
+				p.terminate(fmt.Errorf("Dispatch: send ACK: %w", err))
+			}
 		}
 	}()
 
 	var decoderErr error
-	shouldAck := true
 	if len(m.Payload) == 1 {
-		method := m.Payload[0].(string)
+		method, ok := m.Payload[0].(string)
+		if !ok {
+			p.recordError(fmt.Errorf("Dispatch: expected selector string, got %T", m.Payload[0]))
+			return
+		}
 
 		if !strings.Contains(method, "logDebugMessage") {
 			log.Debug("Method: " + method)
@@ -38,20 +58,56 @@ func (p proxyDispatcher) Dispatch(m dtx.Message) {
 
 		switch method {
 		case "_XCT_testBundleReadyWithProtocolVersion:minimumVersion:":
-			p.testBundleReadyChannel <- m
+			if p.testBundleReadyChannel == nil {
+				p.recordError(errors.New("Dispatch: test bundle ready channel is nil"))
+				return
+			}
+			if p.dtxConnection == nil {
+				p.recordError(errors.New("Dispatch: DTX connection is nil while delivering test bundle ready"))
+				return
+			}
+			select {
+			case <-p.dtxConnection.Closed():
+				return
+			case p.testBundleReadyChannel <- m:
+			default:
+				// Only the first readiness notification is useful. A duplicate must
+				// not stall the sole DTX reader when nobody drains this channel.
+				log.WithField("dispatcher", p.id).Warn("dropping duplicate XCTest bundle-ready notification")
+			}
 			return
 		case "_XCT_testRunnerReadyWithCapabilities:":
 			shouldAck = false
 			log.Debug("received testRunnerReadyWithCapabilities")
-			resp, _ := p.testRunnerReadyWithCapabilities(m)
-			payload, _ := nskeyedarchiver.ArchiveBin(resp)
+			if p.testRunnerReadyWithCapabilities == nil {
+				p.terminate(errors.New("Dispatch: test runner capabilities handler is nil"))
+				return
+			}
+			resp, err := p.testRunnerReadyWithCapabilities(m)
+			if err != nil {
+				p.terminate(fmt.Errorf("Dispatch: create test runner capabilities response: %w", err))
+				return
+			}
+			payload, err := nskeyedarchiver.ArchiveBin(resp)
+			if err != nil {
+				p.terminate(fmt.Errorf("Dispatch: archive test runner capabilities response: %w", err))
+				return
+			}
 			messageBytes, decoderErr := dtx.Encode(m.Identifier, 1, m.ChannelCode, false, dtx.ResponseWithReturnValueInPayload, payload, dtx.NewPrimitiveDictionary())
 			if decoderErr != nil { // Actually an encoder error but we can utilize the same logic for decoder errors and quit early
-				break
+				p.terminate(fmt.Errorf("Dispatch: encode test runner capabilities response: %w", decoderErr))
+				return
 			}
 
 			log.Debug("sending response for capabs")
-			p.dtxConnection.Send(messageBytes)
+			if p.dtxConnection == nil {
+				p.terminate(errors.New("Dispatch: DTX connection is nil while sending test runner capabilities response"))
+				return
+			}
+			if err := p.dtxConnection.Send(messageBytes); err != nil {
+				p.terminate(fmt.Errorf("Dispatch: send test runner capabilities response: %w", err))
+				return
+			}
 		case "_XCT_didBeginExecutingTestPlan":
 			log.Debug("_XCT_didBeginExecutingTestPlan received. Executing test.")
 		case "_XCT_didFinishExecutingTestPlan":
@@ -477,14 +533,47 @@ func (p proxyDispatcher) Dispatch(m dtx.Message) {
 	}
 
 	if decoderErr != nil {
-		dispatcher.testListener.err = decoderErr
-	}
-
-	if shouldAck {
-		dtx.SendAckIfNeeded(p.dtxConnection, m)
+		p.recordError(decoderErr)
 	}
 
 	log.Tracef("dispatcher received: %s", m.String())
+}
+
+func (p proxyDispatcher) sendAckIfNeeded(message dtx.Message) error {
+	if !message.ExpectsReply {
+		return nil
+	}
+	if p.dtxConnection == nil {
+		return dtx.ErrConnectionClosed
+	}
+	return p.dtxConnection.Send(dtx.BuildAckMessage(message))
+}
+
+func (p proxyDispatcher) terminate(err error) {
+	if err == nil {
+		return
+	}
+	if p.testListener != nil {
+		p.testListener.FinishWithError(err)
+	} else {
+		log.WithFields(log.Fields{"dispatcher": p.id, "error": err}).Error("XCTest proxy dispatcher failed terminally")
+	}
+	if p.dtxConnection != nil {
+		if closeErr := p.dtxConnection.Close(); closeErr != nil {
+			log.WithFields(log.Fields{"dispatcher": p.id, "error": closeErr}).Warn("Failed closing XCTest DTX connection after terminal dispatcher error")
+		}
+	}
+}
+
+func (p proxyDispatcher) recordError(err error) {
+	if err == nil {
+		return
+	}
+	if p.testListener != nil {
+		p.testListener.setError(err)
+		return
+	}
+	log.WithFields(log.Fields{"dispatcher": p.id, "error": err}).Error("XCTest proxy dispatcher failed")
 }
 
 func assertArgumentsLengthEqual(m dtx.Message, expectedLength uint) error {

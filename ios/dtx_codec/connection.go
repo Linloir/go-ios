@@ -4,8 +4,9 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
-	"math"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,7 @@ type Connection struct {
 	globalChannel          *Channel
 	capabilities           map[string]interface{}
 	mutex                  sync.Mutex
+	sendMu                 sync.Mutex
 	requestChannelMessages chan Message
 
 	// MessageDispatcher use this prop to catch messages from GlobalDispatcher
@@ -40,8 +42,12 @@ type Connection struct {
 	MessageDispatcher Dispatcher
 
 	closed    chan struct{}
+	errMu     sync.RWMutex
 	err       error
 	closeOnce sync.Once
+
+	deviceCloseOnce sync.Once
+	deviceCloseErr  error
 }
 
 // Dispatcher is a simple interface containing a Dispatch func to receive dtx.Messages
@@ -65,18 +71,24 @@ func (dtxConn *Connection) Closed() <-chan struct{} {
 
 // Err is non-nil when the connection was closed (when Close was called this will be ErrConnectionClosed)
 func (dtxConn *Connection) Err() error {
+	dtxConn.errMu.RLock()
+	defer dtxConn.errMu.RUnlock()
 	return dtxConn.err
 }
 
 // Close closes the underlying deviceConnection
 func (dtxConn *Connection) Close() error {
-	if dtxConn.deviceConnection != nil {
-		err := dtxConn.deviceConnection.Close()
-		dtxConn.close(err)
-		return err
-	}
 	dtxConn.close(ErrConnectionClosed)
-	return nil
+	return dtxConn.closeDeviceConnection()
+}
+
+func (dtxConn *Connection) closeDeviceConnection() error {
+	dtxConn.deviceCloseOnce.Do(func() {
+		if dtxConn.deviceConnection != nil {
+			dtxConn.deviceCloseErr = dtxConn.deviceConnection.Close()
+		}
+	})
+	return dtxConn.deviceCloseErr
 }
 
 // GlobalChannel returns the connections automatically created global channel.
@@ -111,9 +123,13 @@ func (dtxConn *Connection) Dispatch(msg Message) {
 // Dispatch prints log messages and errors when they are received and also creates local Channels when requested by the device.
 func (g GlobalDispatcher) Dispatch(msg Message) {
 	SendAckIfNeeded(g.dtxConnection, msg)
-	if msg.Payload != nil {
+	if len(msg.Payload) > 0 {
 		if requestChannel == msg.Payload[0] {
-			g.requestChannelMessages <- msg
+			select {
+			case g.requestChannelMessages <- msg:
+			default:
+				log.Warn("dropping DTX channel request because the request queue is full")
+			}
 		}
 		// TODO: use the dispatchFunctions map
 		if "outputReceived:fromProcess:atTime:" == msg.Payload[0] {
@@ -140,7 +156,7 @@ func (g GlobalDispatcher) Dispatch(msg Message) {
 	}
 	log.Tracef("Global Dispatcher Received: %s %s", msg.Payload, msg.Auxiliary)
 	if msg.HasError() {
-		log.Error(msg.Payload[0])
+		log.Error(msg.Payload)
 	}
 	if msg.PayloadHeader.MessageType == UnknownTypeOne || msg.PayloadHeader.MessageType == ResponseWithReturnValueInPayload {
 		g.dtxConnection.Dispatch(msg)
@@ -161,6 +177,18 @@ func NewUsbmuxdConnection(device ios.DeviceEntry, serviceName string) (*Connecti
 	return newDtxConnection(conn)
 }
 
+// NewUsbmuxdConnectionWithDispatcher installs the global message dispatcher
+// before the reader goroutine starts. This prevents the first service event
+// from racing a dispatcher assignment performed after construction.
+func NewUsbmuxdConnectionWithDispatcher(device ios.DeviceEntry, serviceName string, dispatcher Dispatcher) (*Connection, error) {
+	conn, err := ios.ConnectToService(device, serviceName)
+	if err != nil {
+		return nil, err
+	}
+
+	return newDtxConnection(conn, dispatcher)
+}
+
 // NewTunnelConnection connects and starts reading from a Dtx based service on the device, using tunnel interface instead of usbmuxd
 func NewTunnelConnection(device ios.DeviceEntry, serviceName string) (*Connection, error) {
 	conn, err := ios.ConnectToServiceTunnelIface(device, serviceName)
@@ -171,11 +199,31 @@ func NewTunnelConnection(device ios.DeviceEntry, serviceName string) (*Connectio
 	return newDtxConnection(conn)
 }
 
-func newDtxConnection(conn ios.DeviceConnectionInterface) (*Connection, error) {
+// NewTunnelConnectionWithDispatcher is the tunnel equivalent of
+// NewUsbmuxdConnectionWithDispatcher.
+func NewTunnelConnectionWithDispatcher(device ios.DeviceEntry, serviceName string, dispatcher Dispatcher) (*Connection, error) {
+	conn, err := ios.ConnectToServiceTunnelIface(device, serviceName)
+	if err != nil {
+		return nil, err
+	}
+
+	return newDtxConnection(conn, dispatcher)
+}
+
+func newDtxConnection(conn ios.DeviceConnectionInterface, messageDispatchers ...Dispatcher) (*Connection, error) {
 	requestChannelMessages := make(chan Message, 5)
+	var messageDispatcher Dispatcher
+	if len(messageDispatchers) > 0 {
+		messageDispatcher = messageDispatchers[0]
+	}
 
 	// The global channel has channelCode 0, so we need to start with channelCodeCounter==1
-	dtxConnection := &Connection{deviceConnection: conn, channelCodeCounter: 1, requestChannelMessages: requestChannelMessages}
+	dtxConnection := &Connection{
+		deviceConnection:       conn,
+		channelCodeCounter:     1,
+		requestChannelMessages: requestChannelMessages,
+		MessageDispatcher:      messageDispatcher,
+	}
 	dtxConnection.closed = make(chan struct{})
 
 	// The global channel is automatically present and used for requesting other channels and some other methods like notifyPublishedCapabilities
@@ -196,16 +244,61 @@ func newDtxConnection(conn ios.DeviceConnectionInterface) (*Connection, error) {
 
 // Send sends the byte slice directly to the device using the underlying DeviceConnectionInterface
 func (dtxConn *Connection) Send(message []byte) error {
-	return dtxConn.deviceConnection.Send(message)
+	if dtxConn == nil || dtxConn.deviceConnection == nil {
+		return ErrConnectionClosed
+	}
+	dtxConn.sendMu.Lock()
+	defer dtxConn.sendMu.Unlock()
+	select {
+	case <-dtxConn.closed:
+		if err := dtxConn.Err(); err != nil {
+			return err
+		}
+		return ErrConnectionClosed
+	default:
+	}
+
+	written := 0
+	for written < len(message) {
+		n, err := dtxConn.deviceConnection.Writer().Write(message[written:])
+		if n < 0 || n > len(message)-written {
+			err = fmt.Errorf("invalid DTX write count %d", n)
+		}
+		written += n
+		if err != nil {
+			dtxConn.close(err)
+			_ = dtxConn.closeDeviceConnection()
+			return err
+		}
+		if n == 0 {
+			err = io.ErrShortWrite
+			dtxConn.close(err)
+			_ = dtxConn.closeDeviceConnection()
+			return err
+		}
+	}
+	return nil
 }
 
 // reader reads messages from the byte stream and dispatches them to the right channel when they are decoded.
 func reader(dtxConn *Connection) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err := fmt.Errorf("DTX reader panic: %v", recovered)
+			dtxConn.close(err)
+			_ = dtxConn.closeDeviceConnection()
+			log.WithFields(log.Fields{"error": err, "stack": string(debug.Stack())}).Error("DTX reader stopped after panic")
+		}
+	}()
 	reader := bufio.NewReader(dtxConn.deviceConnection.Reader())
 	for {
 		msg, err := ReadMessage(reader)
 		if err != nil {
-			defer dtxConn.close(err)
+			dtxConn.close(err)
+			// A peer-side EOF used to signal Closed without releasing the local
+			// transport. Close it here as well so callers waiting on Closed (or
+			// callers that fail to run their own cleanup) cannot strand an fd.
+			_ = dtxConn.closeDeviceConnection()
 			errText := err.Error()
 			if err == io.EOF || strings.Contains(errText, "use of closed network") {
 				log.Debug("DTX Connection with EOF")
@@ -224,7 +317,7 @@ func reader(dtxConn *Connection) {
 }
 
 func SendAckIfNeeded(dtxConn *Connection, msg Message) {
-	if msg.ExpectsReply {
+	if msg.ExpectsReply && dtxConn != nil {
 		ack := BuildAckMessage(msg)
 		err := dtxConn.Send(ack)
 		if err != nil {
@@ -234,16 +327,82 @@ func SendAckIfNeeded(dtxConn *Connection, msg Message) {
 }
 
 func (dtxConn *Connection) ForChannelRequest(messageDispatcher Dispatcher) *Channel {
-	msg := <-dtxConn.requestChannelMessages
+	channel, err := dtxConn.ForChannelRequestContext(context.Background(), messageDispatcher)
+	if err != nil {
+		log.WithError(err).Error("failed waiting for DTX channel request")
+		return nil
+	}
+	return channel
+}
+
+// ForChannelRequestContext waits for a device-initiated DTX channel request.
+// It stops waiting when the caller cancels or the underlying connection closes.
+func (dtxConn *Connection) ForChannelRequestContext(ctx context.Context, messageDispatcher Dispatcher) (*Channel, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case <-dtxConn.closed:
+		if err := dtxConn.Err(); err != nil {
+			return nil, err
+		}
+		return nil, ErrConnectionClosed
+	default:
+	}
+
+	var msg Message
+	select {
+	case msg = <-dtxConn.requestChannelMessages:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-dtxConn.closed:
+		if err := dtxConn.Err(); err != nil {
+			return nil, err
+		}
+		return nil, ErrConnectionClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case <-dtxConn.closed:
+		if err := dtxConn.Err(); err != nil {
+			return nil, err
+		}
+		return nil, ErrConnectionClosed
+	default:
+	}
+
 	dtxConn.mutex.Lock()
 	defer dtxConn.mutex.Unlock()
 	// code := msg.Auxiliary.GetArguments()[0].(uint32)
-	identifier, _ := nskeyedarchiver.Unarchive(msg.Auxiliary.GetArguments()[1].([]byte))
+	arguments := msg.Auxiliary.GetArguments()
+	if len(arguments) < 2 {
+		return nil, fmt.Errorf("DTX channel request has %d arguments, expected at least 2", len(arguments))
+	}
+	identifierBytes, ok := arguments[1].([]byte)
+	if !ok {
+		return nil, fmt.Errorf("DTX channel request identifier has type %T, expected []byte", arguments[1])
+	}
+	identifier, err := nskeyedarchiver.Unarchive(identifierBytes)
+	if err != nil {
+		return nil, fmt.Errorf("decode DTX channel request identifier: %w", err)
+	}
+	if len(identifier) == 0 {
+		return nil, errors.New("DTX channel request has an empty identifier")
+	}
+	channelName, ok := identifier[0].(string)
+	if !ok {
+		return nil, fmt.Errorf("DTX channel request identifier has type %T, expected string", identifier[0])
+	}
 	// TODO: Setting the channel code here manually to -1 for making testmanagerd work. For some reason it requests the TestDriver proxy channel with code 1 but sends messages on -1. Should probably be fixed somehow
 	// TODO: try to refactor testmanagerd/xcuitest code and use AddDefaultChannelReceiver instead of this function. The only code calling this is in testmanagerd right now.
-	channel := &Channel{channelCode: -1, channelName: identifier[0].(string), messageIdentifier: 1, connection: dtxConn, messageDispatcher: messageDispatcher, responseWaiters: map[int]chan Message{}, defragmenters: map[int]*FragmentDecoder{}, timeout: 5 * time.Second}
+	channel := &Channel{channelCode: -1, channelName: channelName, messageIdentifier: 1, connection: dtxConn, messageDispatcher: messageDispatcher, responseWaiters: map[int]chan Message{}, defragmenters: map[int]*FragmentDecoder{}, timeout: 5 * time.Second}
 	dtxConn.activeChannels.Store(-1, channel)
-	return channel
+	return channel, nil
 }
 
 // AddDefaultChannelReceiver let's you set the Dispatcher for the Channel with code -1 ( or 4294967295 for uint32).
@@ -252,45 +411,68 @@ func (dtxConn *Connection) ForChannelRequest(messageDispatcher Dispatcher) *Chan
 // This channel seems to always be there without explicitly requesting it and sometimes it is used.
 func (dtxConn *Connection) AddDefaultChannelReceiver(messageDispatcher Dispatcher) *Channel {
 	channel := &Channel{channelCode: -1, channelName: "c -1/ 4294967295 receiver channel ", messageIdentifier: 1, connection: dtxConn, messageDispatcher: messageDispatcher, responseWaiters: map[int]chan Message{}, defragmenters: map[int]*FragmentDecoder{}, timeout: 5 * time.Second}
-	dtxConn.activeChannels.Store(uint32(math.MaxUint32), channel)
+	dtxConn.activeChannels.Store(-1, channel)
 	return channel
 }
 
 // RequestChannelIdentifier requests a channel to be opened on the Connection with the given identifier,
 // an automatically assigned channelCode and a Dispatcher for receiving messages.
 func (dtxConn *Connection) RequestChannelIdentifier(identifier string, messageDispatcher Dispatcher, opts ...ChannelOption) *Channel {
+	channel, err := dtxConn.RequestChannelIdentifierWithError(identifier, messageDispatcher, opts...)
+	if err != nil {
+		log.WithFields(log.Fields{"channel_id": identifier, "error": err}).Error("failed requesting channel")
+		return nil
+	}
+	return channel
+}
+
+// RequestChannelIdentifierWithError requests a channel and reports handshake
+// failures to the caller. RequestChannelIdentifier is retained for API
+// compatibility, but returns nil rather than a channel that was never opened.
+func (dtxConn *Connection) RequestChannelIdentifierWithError(identifier string, messageDispatcher Dispatcher, opts ...ChannelOption) (*Channel, error) {
 	dtxConn.mutex.Lock()
 	defer dtxConn.mutex.Unlock()
 	code := dtxConn.channelCodeCounter
 	dtxConn.channelCodeCounter++
 
-	payload, _ := nskeyedarchiver.ArchiveBin(requestChannel)
+	payload, err := nskeyedarchiver.ArchiveBin(requestChannel)
+	if err != nil {
+		return nil, fmt.Errorf("encode DTX channel request selector: %w", err)
+	}
 	auxiliary := NewPrimitiveDictionary()
 	auxiliary.AddInt32(code)
-	arch, _ := nskeyedarchiver.ArchiveBin(identifier)
+	arch, err := nskeyedarchiver.ArchiveBin(identifier)
+	if err != nil {
+		return nil, fmt.Errorf("encode DTX channel identifier %q: %w", identifier, err)
+	}
 	auxiliary.AddBytes(arch)
 	log.WithFields(log.Fields{"channel_id": identifier}).Debug("Requesting channel")
+	channel := &Channel{channelCode: code, channelName: identifier, messageIdentifier: 1, connection: dtxConn, messageDispatcher: messageDispatcher, responseWaiters: map[int]chan Message{}, defragmenters: map[int]*FragmentDecoder{}, timeout: 5 * time.Second}
+	for _, opt := range opts {
+		opt(channel)
+	}
+	// Publish the channel before requesting it. The device may send the first
+	// event immediately after its ACK, before sendAndAwaitReply returns.
+	dtxConn.activeChannels.Store(code, channel)
 
 	ctx, cancel := context.WithTimeout(context.Background(), dtxConn.globalChannel.timeout)
 	defer cancel()
 	rply, err := dtxConn.globalChannel.sendAndAwaitReply(ctx, true, Methodinvocation, payload, auxiliary)
 	log.Debug(rply)
 	if err != nil {
-		log.WithFields(log.Fields{"channel_id": identifier, "error": err}).Error("failed requesting channel")
+		dtxConn.activeChannels.Delete(code)
+		return nil, fmt.Errorf("request DTX channel %q: %w", identifier, err)
 	}
 	log.WithFields(log.Fields{"channel_id": identifier}).Debug("Channel open")
-	channel := &Channel{channelCode: code, channelName: identifier, messageIdentifier: 1, connection: dtxConn, messageDispatcher: messageDispatcher, responseWaiters: map[int]chan Message{}, defragmenters: map[int]*FragmentDecoder{}, timeout: 5 * time.Second}
-	dtxConn.activeChannels.Store(code, channel)
-	for _, opt := range opts {
-		opt(channel)
-	}
 
-	return channel
+	return channel, nil
 }
 
 func (dtxConn *Connection) close(err error) {
 	dtxConn.closeOnce.Do(func() {
+		dtxConn.errMu.Lock()
 		dtxConn.err = err
+		dtxConn.errMu.Unlock()
 		close(dtxConn.closed)
 	})
 }

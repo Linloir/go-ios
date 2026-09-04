@@ -20,18 +20,30 @@ type DeviceStateControl struct {
 	conn           *dtx.Connection
 }
 
+// Close releases the Instruments/DTX connection owned by the control.
+func (d *DeviceStateControl) Close() error {
+	if d == nil || d.conn == nil {
+		return nil
+	}
+	return d.conn.Close()
+}
+
 // NewDeviceStateControl creates and connects a new DeviceStateControl that is ready to use
 func NewDeviceStateControl(device ios.DeviceEntry) (*DeviceStateControl, error) {
 	dtxConn, err := connectInstruments(device)
 	if err != nil {
 		return nil, err
 	}
-	conditionInducerChannel := dtxConn.RequestChannelIdentifier(
+	conditionInducerChannel, err := dtxConn.RequestChannelIdentifierWithError(
 		conditionInducerChannelName,
 		loggingDispatcher{dtxConn},
 		// ThermalConditions tend to take a lot of time to enable, so we have to increase the timeout here.
 		dtx.WithTimeout(120),
 	)
+	if err != nil {
+		_ = dtxConn.Close()
+		return nil, fmt.Errorf("request condition inducer channel: %w", err)
+	}
 	return &DeviceStateControl{controlChannel: conditionInducerChannel, conn: dtxConn}, nil
 }
 

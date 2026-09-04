@@ -58,7 +58,11 @@ func NewProcessControl(device ios.DeviceEntry) (*ProcessControl, error) {
 	if err != nil {
 		return nil, err
 	}
-	processControlChannel := dtxConn.RequestChannelIdentifier(procControlChannel, loggingDispatcher{dtxConn})
+	processControlChannel, err := dtxConn.RequestChannelIdentifierWithError(procControlChannel, loggingDispatcher{dtxConn})
+	if err != nil {
+		_ = dtxConn.Close()
+		return nil, fmt.Errorf("request process control channel: %w", err)
+	}
 	return &ProcessControl{processControlChannel: processControlChannel, conn: dtxConn}, nil
 }
 

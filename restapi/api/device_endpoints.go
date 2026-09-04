@@ -131,6 +131,7 @@ func Info(c *gin.Context) {
 		log.Debugf("could not open instruments, probably dev image not mounted %v", err)
 	}
 	if err == nil {
+		defer svc.Close()
 		info, err := svc.NetworkInformation()
 		if err != nil {
 			log.Debugf("error getting networkinfo from instruments %v", err)
@@ -294,6 +295,7 @@ func GetSupportedConditions(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, GenericResponse{Error: err.Error()})
 		return
 	}
+	defer control.Close()
 
 	profileTypes, err := control.List()
 	if err != nil {
@@ -345,6 +347,12 @@ func EnableDeviceCondition(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, GenericResponse{Error: err.Error()})
 		return
 	}
+	keepControl := false
+	defer func() {
+		if !keepControl {
+			_ = control.Close()
+		}
+	}()
 
 	profileTypes, err := control.List()
 	if err != nil {
@@ -370,6 +378,7 @@ func EnableDeviceCondition(c *gin.Context) {
 	// which we can use in `DisableDeviceCondition()` to successfully disable the active condition
 	newDeviceCondition := deviceCondition{ProfileType: profileType, Profile: profile, StateControl: control}
 	deviceConditionsMap[device.Properties.SerialNumber] = newDeviceCondition
+	keepControl = true
 
 	c.JSON(http.StatusOK, GenericResponse{Message: "Enabled condition for ProfileType=" + profileTypeID + " and Profile=" + profileID})
 }
@@ -402,8 +411,12 @@ func DisableDeviceCondition(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, GenericResponse{Error: err.Error()})
 		return
 	}
-
+	closeErr := conditionedDevice.StateControl.Close()
 	delete(deviceConditionsMap, udid)
+	if closeErr != nil {
+		c.JSON(http.StatusInternalServerError, GenericResponse{Error: closeErr.Error()})
+		return
+	}
 
 	c.JSON(http.StatusOK, GenericResponse{Message: "Device condition disabled"})
 }

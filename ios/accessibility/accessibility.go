@@ -16,10 +16,15 @@ func NewWithoutEventChangeListeners(device ios.DeviceEntry) (*ControlInterface, 
 	if err != nil {
 		return nil, err
 	}
-	return &ControlInterface{
+	control := &ControlInterface{
 		cm:      conn,
 		channel: conn.GlobalChannel(),
-	}, nil
+	}
+	// SwitchToDevice, EnableSelectionMode and TurnOff synchronously wait for
+	// these two replies even when continuous event listeners are disabled.
+	control.channel.RegisterMethodForRemote("hostInspectorCurrentElementChanged:")
+	control.channel.RegisterMethodForRemote("hostInspectorMonitoredEventTypeChanged:")
+	return control, nil
 }
 
 // New creates and connects to the given device, a new ControlInterface instance
@@ -36,5 +41,9 @@ func New(ctx context.Context, device ios.DeviceEntry, notifier AccessibilityInsp
 	}
 
 	err = control.init(ctx)
+	if err != nil {
+		_ = control.Close()
+		return nil, err
+	}
 	return control, err
 }

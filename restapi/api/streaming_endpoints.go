@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
 
 	"github.com/danielpaulus/go-ios/ios"
 	"github.com/danielpaulus/go-ios/ios/instruments"
@@ -12,6 +14,31 @@ import (
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
 )
+
+func closeStreamOnRequestDone(ctx context.Context, closeFunc func() error) func() {
+	done := make(chan struct{})
+	watcherDone := make(chan struct{})
+	var closeOnce sync.Once
+	var cleanupOnce sync.Once
+	closeTransport := func() {
+		closeOnce.Do(func() { _ = closeFunc() })
+	}
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-ctx.Done():
+			closeTransport()
+		case <-done:
+		}
+	}()
+	return func() {
+		cleanupOnce.Do(func() {
+			close(done)
+			<-watcherDone
+			closeTransport()
+		})
+	}
+}
 
 // Notifications uses instruments to get application state change events. It will stream the events as json objects separated by line breaks until it errors out.
 // Listen                godoc
@@ -25,14 +52,17 @@ func Notifications(c *gin.Context) {
 	device := c.MustGet(IOS_KEY).(ios.DeviceEntry)
 	listenerFunc, closeFunc, err := instruments.ListenAppStateNotifications(device)
 	if err != nil {
-		log.Fatal(err)
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
+	// Gin cannot observe clientGone while listenerFunc is blocked waiting for a
+	// device event. Closing the transport wakes it and lets the handler return.
+	defer closeStreamOnRequestDone(c.Request.Context(), closeFunc)()
 	c.Stream(func(w io.Writer) bool {
 
 		notification, err := listenerFunc()
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, err)
-			closeFunc()
 			return false
 		}
 
@@ -40,7 +70,6 @@ func Notifications(c *gin.Context) {
 
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, err)
-			closeFunc()
 			return false
 		}
 		w.Write([]byte("\n"))
@@ -66,11 +95,15 @@ func Syslog(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": err})
 		return
 	}
+	defer closeStreamOnRequestDone(c.Request.Context(), syslogConnection.Close)()
 	c.Stream(func(w io.Writer) bool {
-		m, _ := syslogConnection.ReadLogMessage()
+		m, err := syslogConnection.ReadLogMessage()
+		if err != nil {
+			return false
+		}
 		// Stream message to client from message channel
-		w.Write([]byte(MustMarshal(m)))
-		return true
+		_, err = w.Write([]byte(MustMarshal(m)))
+		return err == nil
 	})
 }
 
@@ -110,15 +143,17 @@ func OsTrace(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	defer conn.Close()
+	defer closeStreamOnRequestDone(c.Request.Context(), conn.Close)()
 	c.Stream(func(w io.Writer) bool {
 		entry, err := conn.ReadFilteredEntry(clientFilter)
 		if err != nil {
 			return false
 		}
-		w.Write([]byte(MustMarshal(entry)))
-		w.Write([]byte("\n"))
-		return true
+		if _, err := w.Write([]byte(MustMarshal(entry))); err != nil {
+			return false
+		}
+		_, err = w.Write([]byte("\n"))
+		return err == nil
 	})
 }
 
@@ -133,11 +168,19 @@ func OsTrace(c *gin.Context) {
 func Listen(c *gin.Context) {
 	// We are streaming current time to clients in the interval 10 seconds
 	log.Info("connect")
-	a, _, _ := ios.Listen()
+	a, closeFunc, err := ios.Listen()
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer closeStreamOnRequestDone(c.Request.Context(), closeFunc)()
 	c.Stream(func(w io.Writer) bool {
-		l, _ := a()
+		l, err := a()
+		if err != nil {
+			return false
+		}
 		// Stream message to client from message channel
-		w.Write([]byte(MustMarshal(l)))
-		return true
+		_, err = w.Write([]byte(MustMarshal(l)))
+		return err == nil
 	})
 }

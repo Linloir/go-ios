@@ -99,6 +99,7 @@ func (c *Connection) LaunchAppWithStdIo(bundleId string, args []interface{}, env
 
 	pid, err := c.launchApp(bundleId, args, env, options, terminateExisting, stdIoConfig)
 	if err != nil {
+		_ = stdio.Close()
 		return LaunchedAppWithStdIo{}, fmt.Errorf("LaunchAppWithStdIo: failed to launch app: %w", err)
 	}
 	return LaunchedAppWithStdIo{

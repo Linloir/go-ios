@@ -17,14 +17,19 @@ import (
 
 // TestListener collects test results from the test execution
 type TestListener struct {
+	stateMu              sync.RWMutex
+	writerMu             sync.Mutex
+	sharedWriterMu       *sync.Mutex
 	finished             chan struct{}
 	finishedOnce         sync.Once
 	err                  error
 	logWriter            io.Writer
 	debugLogWriter       io.Writer
 	attachmentsDirectory string
+	writeAttachment      func(string, []byte) error
 	TestSuites           []TestSuite
 	runningTestSuite     *TestSuite
+	nextSuiteIdentity    uint64
 }
 
 type TestSuite struct {
@@ -34,6 +39,7 @@ type TestSuite struct {
 	TestDuration  time.Duration
 	TotalDuration time.Duration
 	TestCases     []TestCase
+	identity      uint64
 }
 
 type TestCase struct {
@@ -83,21 +89,29 @@ func NewTestListener(logWriter io.Writer, debugLogWriter io.Writer, attachmentsD
 }
 
 func (t *TestListener) didFinishExecutingTestPlan() {
-	t.executionFinished()
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
+	t.executionFinishedLocked()
 }
 
 func (t *TestListener) initializationForUITestingDidFailWithError(err nskeyedarchiver.NSError) {
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
 	t.err = err
-	t.executionFinished()
+	t.executionFinishedLocked()
 }
 
 func (t *TestListener) didFailToBootstrapWithError(err nskeyedarchiver.NSError) {
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
 	t.err = err
-	t.executionFinished()
+	t.executionFinishedLocked()
 }
 
 func (t *TestListener) testCaseStalled(testClass string, method string, file string, line uint64) {
-	testCase := t.findTestCase(testClass, method)
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
+	testCase := t.findTestCaseLocked(testClass, method)
 	if testCase != nil {
 		testCase.Status = StatusStalled
 		testCase.Err = TestError{
@@ -109,31 +123,98 @@ func (t *TestListener) testCaseStalled(testClass string, method string, file str
 }
 
 func (t *TestListener) testCaseFinished(testClass string, testMethod string, xcActivityRecord nskeyedarchiver.XCActivityRecord) {
-	ts := t.findTestSuite(testClass)
-	testCase := t.findTestCase(testClass, testMethod)
+	t.stateMu.Lock()
+	target, ok := t.attachmentTargetLocked(testClass, testMethod)
+	t.stateMu.Unlock()
+	if !ok {
+		log.Debug(fmt.Sprintf("Received testCaseFinished for %s:%s without initialization", testClass, testMethod))
+		return
+	}
+
+	attachments := t.persistAttachments(xcActivityRecord)
+	if len(attachments) == 0 {
+		return
+	}
+
+	t.stateMu.Lock()
+	testCase := t.findAttachmentTargetLocked(target)
+	if testCase == nil {
+		t.stateMu.Unlock()
+		removeAttachments(attachments)
+		log.Debug(fmt.Sprintf("Received testCaseFinished for %s:%s after its test suite was discarded", testClass, testMethod))
+		return
+	}
+	testCase.Attachments = append(testCase.Attachments, attachments...)
+	t.stateMu.Unlock()
+}
+
+type attachmentTarget struct {
+	suiteIdentity uint64
+	caseIndex     int
+}
+
+func (t *TestListener) attachmentTargetLocked(testClass string, testMethod string) (attachmentTarget, bool) {
+	ts := t.findTestSuiteLocked(testClass)
+	testCase := t.findTestCaseLocked(testClass, testMethod)
 	if ts == nil || testCase == nil || testClass == "none" || testMethod == "none" {
-		// Attachments of activity records are reported under a special test class named "none"
-		// That's unfortunately the default behavior defined by Apple.
-		// This if block is a safe guard to auto correct the test case information
+		// Apple reports some activity attachments under a synthetic "none" case.
 		ts = t.runningTestSuite
-		if len(ts.TestCases) == 0 {
-			log.Debug(fmt.Sprintf("Received testCaseFinished for %s:%s without initialization", testClass, testMethod))
-			return
+		if ts == nil || len(ts.TestCases) == 0 {
+			return attachmentTarget{}, false
 		}
 		testCase = &ts.TestCases[len(ts.TestCases)-1]
 	}
+	caseIndex := -1
+	for index := range ts.TestCases {
+		if &ts.TestCases[index] == testCase {
+			caseIndex = index
+			break
+		}
+	}
+	if caseIndex < 0 {
+		return attachmentTarget{}, false
+	}
+	if ts.identity == 0 {
+		t.nextSuiteIdentity++
+		ts.identity = t.nextSuiteIdentity
+	}
+	return attachmentTarget{suiteIdentity: ts.identity, caseIndex: caseIndex}, true
+}
 
+func (t *TestListener) findAttachmentTargetLocked(target attachmentTarget) *TestCase {
+	if testCase := testCaseForAttachmentTarget(t.runningTestSuite, target); testCase != nil {
+		return testCase
+	}
+	for index := range t.TestSuites {
+		if testCase := testCaseForAttachmentTarget(&t.TestSuites[index], target); testCase != nil {
+			return testCase
+		}
+	}
+	return nil
+}
+
+func testCaseForAttachmentTarget(suite *TestSuite, target attachmentTarget) *TestCase {
+	if suite == nil || suite.identity != target.suiteIdentity || target.caseIndex < 0 || target.caseIndex >= len(suite.TestCases) {
+		return nil
+	}
+	return &suite.TestCases[target.caseIndex]
+}
+
+func (t *TestListener) persistAttachments(xcActivityRecord nskeyedarchiver.XCActivityRecord) []TestAttachment {
+	attachments := make([]TestAttachment, 0, len(xcActivityRecord.Attachments))
+	writeAttachment := t.writeAttachment
+	if writeAttachment == nil {
+		writeAttachment = func(path string, payload []byte) error {
+			return os.WriteFile(path, payload, 0o666)
+		}
+	}
 	for _, attachment := range xcActivityRecord.Attachments {
 		attachmentsPath := filepath.Join(t.attachmentsDirectory, uuid.New().String())
-		file, err := os.Create(attachmentsPath)
-		if err != nil {
+		if err := writeAttachment(attachmentsPath, attachment.Payload); err != nil {
 			log.WithFields(log.Fields{"error": err, "attachment": attachment.Name}).Warn("Received testCaseFinished with activity record but failed writing attachments to disk. Ignoring attachment")
 			continue
 		}
-		defer file.Close()
-
-		file.Write(attachment.Payload)
-		testCase.Attachments = append(testCase.Attachments, TestAttachment{
+		attachments = append(attachments, TestAttachment{
 			Name:                  strings.Clone(attachment.Name),
 			Timestamp:             attachment.Timestamp,
 			Activity:              strings.Clone(xcActivityRecord.Title),
@@ -141,6 +222,15 @@ func (t *TestListener) testCaseFinished(testClass string, testMethod string, xcA
 			Type:                  strings.Clone(xcActivityRecord.ActivityType),
 			UniformTypeIdentifier: strings.Clone(attachment.UniformTypeIdentifier),
 		})
+	}
+	return attachments
+}
+
+func removeAttachments(attachments []TestAttachment) {
+	for _, attachment := range attachments {
+		if err := os.Remove(attachment.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.WithFields(log.Fields{"error": err, "attachment": attachment.Name}).Warn("Failed cleaning up an unclaimed test attachment")
+		}
 	}
 }
 
@@ -150,6 +240,8 @@ func (t *TestListener) testSuiteDidStart(suiteName string, date string) {
 		log.WithFields(log.Fields{"error": err}).Warn("Cannot parse test suite start date")
 		d = time.Now()
 	}
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
 
 	if t.runningTestSuite != nil {
 		log.Warn("A new test suite starts running while another one is in progress, finalizing the previous one")
@@ -164,8 +256,10 @@ func (t *TestListener) testSuiteDidStart(suiteName string, date string) {
 }
 
 func (t *TestListener) testCaseDidStartForClass(testClass string, testMethod string) {
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
 	// Find the existing test suite or create a new one if not found
-	ts := t.findTestSuite(testClass)
+	ts := t.findTestSuiteLocked(testClass)
 	if ts == nil {
 		// If no test suite is found and we're not in a running test suite,
 		// we should use the runningTestSuite instead of creating a new one.
@@ -196,10 +290,16 @@ func (t *TestListener) testCaseDidStartForClass(testClass string, testMethod str
 }
 
 func (t *TestListener) testCaseFailedForClass(testClass string, testMethod string, message string, file string, line uint64) {
-	testCase := t.findTestCase(testClass, testMethod)
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
+	testCase := t.findTestCaseLocked(testClass, testMethod)
 	if testCase == nil {
 		log.Warn("Received failure status for an unknown test, adding it to suite")
-		ts := t.findTestSuite(testClass)
+		ts := t.findTestSuiteLocked(testClass)
+		if ts == nil {
+			log.Warn("Received failure status without a running test suite, ignoring it")
+			return
+		}
 		ts.TestCases = append(ts.TestCases, TestCase{
 			ClassName:  testClass,
 			MethodName: testMethod,
@@ -216,7 +316,9 @@ func (t *TestListener) testCaseFailedForClass(testClass string, testMethod strin
 }
 
 func (t *TestListener) testCaseDidFinishForTest(testClass string, testMethod string, status string, duration float64) {
-	testCase := t.findTestCase(testClass, testMethod)
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
+	testCase := t.findTestCaseLocked(testClass, testMethod)
 	if testCase != nil {
 		// We override "failed" status for stalled tests with the value "stalled" to be able to distinguish them later
 		if testCase.Status != StatusStalled {
@@ -239,8 +341,10 @@ func (t *TestListener) testSuiteFinished(suiteName string, date string, testCoun
 		log.WithFields(log.Fields{"error": err}).Warn("Cannot parse test suite start date")
 		endDate = time.Now()
 	}
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
 
-	ts := t.findTestSuite(suiteName)
+	ts := t.findTestSuiteLocked(suiteName)
 	if ts == nil {
 		log.Debug(fmt.Sprintf("Received testSuiteFinished for %s without initialization", suiteName))
 		return
@@ -267,33 +371,93 @@ func (t *TestListener) testSuiteFinished(suiteName string, date string, testCoun
 }
 
 func (t *TestListener) LogMessage(msg string) {
-	t.logWriter.Write([]byte(msg))
+	_, _ = t.Write([]byte(msg))
+}
+
+// Write serializes writes to the listener's primary log writer. It lets
+// stdout forwarding and DTX log callbacks share even non-thread-safe writers.
+func (t *TestListener) Write(p []byte) (int, error) {
+	writerMu := t.outputWriterMutex()
+	writerMu.Lock()
+	defer writerMu.Unlock()
+	return t.logWriter.Write(p)
 }
 
 func (t *TestListener) LogDebugMessage(msg string) {
-	t.debugLogWriter.Write([]byte(msg))
+	writerMu := t.outputWriterMutex()
+	writerMu.Lock()
+	defer writerMu.Unlock()
+	_, _ = t.debugLogWriter.Write([]byte(msg))
+}
+
+func (t *TestListener) outputWriterMutex() *sync.Mutex {
+	if t.sharedWriterMu != nil {
+		return t.sharedWriterMu
+	}
+	return &t.writerMu
+}
+
+// newTargetListener isolates all mutable XCTest state while preserving the
+// caller's output destinations. The shared writer mutex also serializes a
+// late stdout copy from an old target with callbacks from the next target.
+func (t *TestListener) newTargetListener() *TestListener {
+	return &TestListener{
+		sharedWriterMu:       t.outputWriterMutex(),
+		finished:             make(chan struct{}),
+		logWriter:            t.logWriter,
+		debugLogWriter:       t.debugLogWriter,
+		attachmentsDirectory: t.attachmentsDirectory,
+		writeAttachment:      t.writeAttachment,
+		TestSuites:           make([]TestSuite, 0),
+	}
 }
 
 func (t *TestListener) TestRunnerKilled() {
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
 	t.err = errors.New("Test runner has been explicitly killed.")
-	t.executionFinished()
+	t.executionFinishedLocked()
 }
 
 func (t *TestListener) FinishWithError(err error) {
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
 	if t.runningTestSuite != nil {
 		t.TestSuites = append(t.TestSuites, *t.runningTestSuite)
 		t.runningTestSuite = nil
 	}
 	t.err = err
-	t.executionFinished()
+	t.executionFinishedLocked()
 }
 
 func (t *TestListener) Done() <-chan struct{} {
+	t.stateMu.RLock()
+	defer t.stateMu.RUnlock()
 	return t.finished
 }
 
-func (t *TestListener) findTestCase(className string, methodName string) *TestCase {
-	if ts := t.findTestSuite(className); ts != nil {
+// Result returns a deep snapshot of the completed test suites and the current
+// terminal error. Callers may safely mutate the returned slices.
+func (t *TestListener) Result() ([]TestSuite, error) {
+	if t == nil {
+		return nil, errors.New("test listener is nil")
+	}
+	t.stateMu.RLock()
+	defer t.stateMu.RUnlock()
+	return cloneTestSuites(t.TestSuites), t.err
+}
+
+func (t *TestListener) setError(err error) {
+	if t == nil || err == nil {
+		return
+	}
+	t.stateMu.Lock()
+	t.err = err
+	t.stateMu.Unlock()
+}
+
+func (t *TestListener) findTestCaseLocked(className string, methodName string) *TestCase {
+	if ts := t.findTestSuiteLocked(className); ts != nil {
 		if len(ts.TestCases) > 0 {
 			tc := &ts.TestCases[len(ts.TestCases)-1]
 			if tc.ClassName == className && tc.MethodName == methodName {
@@ -315,7 +479,21 @@ func (t *TestListener) findTestCase(className string, methodName string) *TestCa
 	return nil
 }
 
+// findTestSuite returns a detached snapshot for callers that only need to
+// inspect the currently running suite. Mutations must stay behind stateMu and
+// use findTestSuiteLocked instead.
 func (t *TestListener) findTestSuite(className string) *TestSuite {
+	t.stateMu.RLock()
+	defer t.stateMu.RUnlock()
+	suite := t.findTestSuiteLocked(className)
+	if suite == nil {
+		return nil
+	}
+	cloned := cloneTestSuites([]TestSuite{*suite})
+	return &cloned[0]
+}
+
+func (t *TestListener) findTestSuiteLocked(className string) *TestSuite {
 	if t.runningTestSuite != nil {
 		if t.runningTestSuite.Name == className {
 			return t.runningTestSuite
@@ -325,13 +503,15 @@ func (t *TestListener) findTestSuite(className string) *TestSuite {
 	return nil
 }
 
-func (t *TestListener) executionFinished() {
+func (t *TestListener) executionFinishedLocked() {
 	t.finishedOnce.Do(func() {
 		close(t.finished)
 	})
 }
 
 func (t *TestListener) reset() {
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
 	// Reinitialize finished channel to allow signaling again
 	t.finished = make(chan struct{})
 
@@ -346,4 +526,27 @@ func (t *TestListener) reset() {
 
 	// Clear the reference to the running test suite
 	t.runningTestSuite = nil
+}
+
+func cloneTestSuites(suites []TestSuite) []TestSuite {
+	if suites == nil {
+		return nil
+	}
+	cloned := make([]TestSuite, len(suites))
+	for suiteIndex := range suites {
+		cloned[suiteIndex] = suites[suiteIndex]
+		cloned[suiteIndex].identity = 0
+		if suites[suiteIndex].TestCases == nil {
+			continue
+		}
+		cloned[suiteIndex].TestCases = make([]TestCase, len(suites[suiteIndex].TestCases))
+		for caseIndex := range suites[suiteIndex].TestCases {
+			cloned[suiteIndex].TestCases[caseIndex] = suites[suiteIndex].TestCases[caseIndex]
+			cloned[suiteIndex].TestCases[caseIndex].Attachments = append(
+				[]TestAttachment(nil),
+				suites[suiteIndex].TestCases[caseIndex].Attachments...,
+			)
+		}
+	}
+	return cloned
 }

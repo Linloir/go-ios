@@ -130,7 +130,11 @@ func NewDeviceInfoService(device ios.DeviceEntry) (*DeviceInfoService, error) {
 	if err != nil {
 		return nil, err
 	}
-	processControlChannel := dtxConn.RequestChannelIdentifier(deviceInfoServiceName, loggingDispatcher{dtxConn})
+	processControlChannel, err := dtxConn.RequestChannelIdentifierWithError(deviceInfoServiceName, loggingDispatcher{dtxConn})
+	if err != nil {
+		_ = dtxConn.Close()
+		return nil, fmt.Errorf("request deviceinfo channel: %w", err)
+	}
 	return &DeviceInfoService{channel: processControlChannel, conn: dtxConn}, nil
 }
 

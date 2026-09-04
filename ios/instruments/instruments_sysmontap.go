@@ -22,7 +22,7 @@ type sysmontapMsgDispatcher struct {
 
 func newSysmontapMsgDispatcher() *sysmontapMsgDispatcher {
 	return &sysmontapMsgDispatcher{
-		messages: make(chan dtx.Message),
+		messages: make(chan dtx.Message, 64),
 		done:     make(chan struct{}),
 	}
 }
@@ -41,7 +41,21 @@ func (p *sysmontapMsgDispatcher) Dispatch(m dtx.Message) {
 
 	select {
 	case p.messages <- m:
+		return
 	case <-p.done:
+		return
+	default:
+	}
+	// Samples are periodic. If the consumer is behind, keep the freshest
+	// bounded window instead of blocking the DTX transport reader forever.
+	select {
+	case <-p.messages:
+	default:
+	}
+	select {
+	case p.messages <- m:
+	case <-p.done:
+	default:
 	}
 }
 
@@ -55,7 +69,15 @@ func (p *sysmontapMsgDispatcher) Close() {
 		// Closing done releases dispatchers blocked on an unconsumed messages
 		// channel. Once they have all returned, it is safe to close messages.
 		p.dispatching.Wait()
-		close(p.messages)
+		for {
+			select {
+			case <-p.messages:
+				continue
+			default:
+				close(p.messages)
+				return
+			}
+		}
 	})
 }
 
@@ -89,12 +111,20 @@ func NewSysmontapServiceWithAttrs(device ios.DeviceEntry, samplingInterval int, 
 		msgDispatcher.Close()
 		return nil, err
 	}
+	go func() {
+		<-dtxConn.Closed()
+		msgDispatcher.Close()
+	}()
 	cleanup := func() {
 		msgDispatcher.Close()
 		_ = dtxConn.Close()
 	}
 
-	processControlChannel := dtxConn.RequestChannelIdentifier(sysmontapName, loggingDispatcher{dtxConn})
+	processControlChannel, err := dtxConn.RequestChannelIdentifierWithError(sysmontapName, loggingDispatcher{dtxConn})
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("request sysmontap channel: %w", err)
+	}
 
 	pa := stringAttrsToInterfaces(procAttrs)
 	sa := stringAttrsToInterfaces(sysAttrs)
@@ -136,13 +166,21 @@ func NewSysmontapService(device ios.DeviceEntry, samplingInterval int) (*sysmont
 		msgDispatcher.Close()
 		return nil, err
 	}
+	go func() {
+		<-dtxConn.Closed()
+		msgDispatcher.Close()
+	}()
 	cleanup := func() {
 		msgDispatcher.Close()
 		_ = dtxConn.Close()
 		deviceInfoService.Close()
 	}
 
-	processControlChannel := dtxConn.RequestChannelIdentifier(sysmontapName, loggingDispatcher{dtxConn})
+	processControlChannel, err := dtxConn.RequestChannelIdentifierWithError(sysmontapName, loggingDispatcher{dtxConn})
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("request sysmontap channel: %w", err)
+	}
 
 	sysAttrs, err := deviceInfoService.systemAttributes()
 	if err != nil {

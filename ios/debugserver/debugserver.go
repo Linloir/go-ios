@@ -170,6 +170,7 @@ func Start(device ios.DeviceEntry, appPath string, stopAtEntry bool) error {
 	if err != nil {
 		return err
 	}
+	defer conn.Close()
 	appinfo, err := conn.BrowseUserApps()
 	if err != nil {
 		return err
@@ -185,10 +186,6 @@ func Start(device ios.DeviceEntry, appPath string, stopAtEntry bool) error {
 		return errors.New("cannot find container of bundleid: " + bundleId)
 	}
 
-	intf, err := connectToDevice(device)
-	if err != nil {
-		return err
-	}
 	// listen at random port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -213,15 +210,39 @@ func Start(device ios.DeviceEntry, appPath string, stopAtEntry bool) error {
 			log.Error(err)
 			continue
 		}
-		go func() {
+		intf, err := connectToDevice(device)
+		if err != nil {
+			_ = localConn.Close()
+			log.WithError(err).Error("failed connecting to device debug server")
+			continue
+		}
+		go func(localConn net.Conn, intf ios.DeviceConnectionInterface) {
+			defer localConn.Close()
 			lc := ios.NewLockDownConnection(intf)
 			cli := &DebugClient{
 				c:         lc,
 				gdbServer: NewGDBServer(lc.Conn()),
 			}
-			// start proxy
-			go io.Copy(localConn, cli.Conn())
-			io.Copy(cli.Conn(), localConn)
-		}()
+			defer cli.Close()
+			relayDebugConnections(localConn, cli.Conn())
+		}(localConn, intf)
 	}
+}
+
+func relayDebugConnections(localConn, deviceConn net.Conn) {
+	done := make(chan struct{}, 2)
+	copyDirection := func(destination, source net.Conn) {
+		_, _ = io.Copy(destination, source)
+		done <- struct{}{}
+	}
+	go copyDirection(localConn, deviceConn)
+	go copyDirection(deviceConn, localConn)
+
+	// EOF in either direction terminates the session. Closing both endpoints
+	// releases the opposite io.Copy, which might otherwise wait forever, then
+	// joining both workers prevents per-session goroutine accumulation.
+	<-done
+	_ = localConn.Close()
+	_ = deviceConn.Close()
+	<-done
 }
